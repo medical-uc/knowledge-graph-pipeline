@@ -528,8 +528,11 @@ def parse_file(md_path: str, *, normalized_path: str = None, doc_id: str = None,
         raw = fh.read()
 
     stem = os.path.splitext(os.path.basename(md_path))[0]
-    normalized_path = normalized_path or os.path.join(
-        os.path.dirname(os.path.abspath(md_path)), stem + ".normalized.md")
+    # Written into the artifacts directory rather than beside the source: the
+    # input may live in a read-only or shared location, and chunk offsets index
+    # into this file, so it belongs with the graph it describes.
+    normalized_path = normalized_path or config.artifact_path(
+        stem + ".normalized.md")
 
     review: list[dict] = scan_markers(raw)
     root = parse_tagged(raw)

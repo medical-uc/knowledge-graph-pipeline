@@ -369,11 +369,17 @@ def main(argv=None):
         description="Single-best-answer MCQs from an asserted medkg graph.")
     ap.add_argument("input", help="graph.ir.json")
     ap.add_argument("--out", default="questions.json")
+    ap.add_argument("--artifacts", default=None,
+                    help=f"directory for generated files "
+                         f"(default: {config.ARTIFACTS_DIR}/)")
     ap.add_argument("--llm", default=None,
                     help="backend profile for stem phrasing; omit for templates only")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args(argv)
 
+    if args.artifacts:
+        config.ARTIFACTS_DIR = args.artifacts
+    args.out = config.artifact_path(args.out)
     doc = Document.from_json(args.input)
     call = None
     if args.llm:

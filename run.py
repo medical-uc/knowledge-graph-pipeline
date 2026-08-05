@@ -168,7 +168,20 @@ def main():
     ap.add_argument("--ontology-check", action="store_true",
                     help="print the ontology/NER reachability report and exit")
     ap.add_argument("--out", "--output", dest="out", default="graph.nq")
+    ap.add_argument("--artifacts", default=None,
+                    help=f"directory for generated files (default: "
+                         f"{config.ARTIFACTS_DIR}/, or $MEDKG_ARTIFACTS). A bare "
+                         f"--out filename lands here; an --out with any "
+                         f"directory component is used verbatim.")
     args = ap.parse_args()
+    if args.artifacts:
+        config.ARTIFACTS_DIR = args.artifacts
+    # Resolved once here rather than at each write: the Stage-2 checkpoint and
+    # the .ir.json are both derived from args.out by string surgery, so fixing
+    # it up front is what keeps the whole set together in one directory.
+    args.out = config.artifact_path(args.out)
+    if getattr(args, "normalized_out", None):
+        args.normalized_out = config.artifact_path(args.normalized_out)
 
     if args.ontology_check:
         print(ontology.summary(config.ONTOLOGY, config.NER_MODELS,
@@ -256,7 +269,7 @@ def main():
         print(f"passages: {len(doc.passages)}  " + "  ".join(f"{k}: {v}" for k, v in sorted(pk.items())))
         print(f"figures: {len(doc.figures)}  needs_review: {len(doc.needs_review)}")
         if args.mode == "stage1":
-            outfile = args.out if args.out.endswith(".json") else "stage1_output.json"
+            outfile = args.out if args.out.endswith(".json") else config.artifact_path("stage1_output.json")
             doc.to_json(outfile)
             print(f"stage-1 IR -> {outfile}")
             return
@@ -289,7 +302,7 @@ def main():
         before = len(doc.relations)
         affirmed_before = sum(1 for r in doc.relations if r.polarity == "affirmed")
         report = guards.run_all(doc)
-        outfile = args.out if args.out.endswith(".json") else "guarded_output.json"
+        outfile = args.out if args.out.endswith(".json") else config.artifact_path("guarded_output.json")
         doc.to_json(outfile)
         print(f"relations: {before} -> {len(doc.relations)} "
               f"(affirmed {affirmed_before} -> {report['affirmed_remaining']})")
@@ -313,7 +326,7 @@ def main():
                 "       is nothing for Stage 3 to link.\n")
             raise SystemExit(2)
         doc = run_stage3(doc, args.index_dir, rerank=rerank)
-        outfile = args.out if args.out.endswith(".json") else "stage3_output.json"
+        outfile = args.out if args.out.endswith(".json") else config.artifact_path("stage3_output.json")
         doc.to_json(outfile)
         linked = sum(1 for s_ in doc.spans if s_.uri)
         print(f"{outfile}: {linked}/{len(doc.spans)} spans linked, "
@@ -322,7 +335,7 @@ def main():
 
     if args.mode == "stage2":
         doc = run_stage2(doc, call_llm=call_llm)
-        outfile = args.out if args.out.endswith(".json") else "stage2_output.json"
+        outfile = args.out if args.out.endswith(".json") else config.artifact_path("stage2_output.json")
         doc.to_json(outfile)
         n_mods = sum(len(s.modifiers) for s in doc.spans)
         print(f"spans: {len(doc.spans)}  relations: {len(doc.relations)}  "

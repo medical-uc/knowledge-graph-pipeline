@@ -34,6 +34,40 @@ RDFS_LABEL    = "http://www.w3.org/2000/01/rdf-schema#label"
 ONTOLOGY = ontology.load()
 
 ANY = "*ANY*"        # sentinel: any entity label is allowed
+
+# --- Where generated files go ----------------------------------------------
+# Everything the pipeline writes -- normalized text, stage checkpoints, the
+# .nq, the IR, MCQs -- lands here instead of scattering across the project
+# root. Overridable per-run with --artifacts or MEDKG_ARTIFACTS.
+ARTIFACTS_DIR = os.environ.get("MEDKG_ARTIFACTS", "artifacts")
+
+
+def artifact_path(name, artifacts_dir=None) -> str:
+    """Resolve an output filename into the artifacts directory.
+
+    A BARE FILENAME is a name and gets redirected; anything carrying a directory
+    component is a path and is left exactly as given. So `--out graph.nq` writes
+    `artifacts/graph.nq`, while `--out ./graph.nq`, `--out /tmp/g.nq` and
+    `--out sub/dir/g.nq` all mean what they say. That distinction is the whole
+    contract: a caller who has typed a path has already decided where the file
+    goes, and silently moving it would be worse than not having the feature.
+
+    The directory is created on demand, so nothing is made until something is
+    actually written.
+    """
+    if not name:
+        return name
+    head, tail = os.path.split(name)
+    if head or os.path.isabs(name):
+        # Honour the path, but make sure it can be written: a full run failing
+        # at serialisation time because a parent directory is missing throws
+        # away everything the pipeline just computed.
+        if head:
+            os.makedirs(head, exist_ok=True)
+        return name
+    target = artifacts_dir or ARTIFACTS_DIR
+    os.makedirs(target, exist_ok=True)
+    return os.path.join(target, tail)
 # tail is None        # sentinel: UNARY relation (no tail), e.g. patient-level assertions
 RELATION_ONTOLOGY: dict[str, dict] = ONTOLOGY["relations"]
 
