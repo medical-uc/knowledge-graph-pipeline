@@ -12,7 +12,7 @@ comprehensive overview of the pipeline.
 All the input files that will be fed to this pipeline is located in the `inputs`
 directory.
 
-## Rules
+## Rules (Do Not Break)
 
 - All outputs should be put into the `artifacts` directory.
 - Scripts should print to the console to indicate their progress. Do not use
@@ -21,6 +21,7 @@ directory.
   items there are to process to indicate progress.
 - Comments in the code should not address changes that I get from you. Write
   them as if the code's been like that from the start.
+- Never make Git PRs on your own.
 
 ## Changelog Maintenance Rules
 
