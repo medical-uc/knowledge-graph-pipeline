@@ -1,0 +1,48 @@
+# medkg dependencies.  Python 3.9–3.11 only: the pinned scispaCy 0.5.4 stack
+# (scipy 1.9.x, nmslib) has no Python 3.12 wheels, and scispaCy 0.5.5+ — which
+# does support 3.12 — never published matching NER models. See pyproject.toml.
+# Install into a fresh venv:  python3.11 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+
+# --- Core graph stack (pure Python — enough for the offline `from-stage3` demo) ---
+rdflib>=7.0
+owlrl>=6.0
+# numpy pinned <2: the scispaCy 0.5.4 / spaCy 3.7 stack expects numpy 1.x, and it
+# also avoids the faiss-cpu numpy-2 ABI segfault seen on macOS.
+numpy>=1.24,<2
+
+# --- Stage 2: NER + negation ---
+# scispaCy and its MODEL must be the SAME version. 0.5.4 is used here because its
+# model URLs exist and the whole chain installs from wheels on Python <=3.11.
+# (0.5.5 supports 3.12 but has no published models; the v0.5.5 model URL 404s.)
+spacy>=3.7,<3.8
+scispacy==0.5.4
+negspacy>=1.0
+# NER models as real, installable dependencies (a comment here caused the earlier
+# E050 "Can't find model" error). Versions MUST match scispacy above.
+#
+# BOTH models are required, not one plus an optional extra. bc5cdr alone emits
+# only DISEASE and CHEMICAL, which leaves 9 of 27 relation types unable to fire
+# for want of a head or tail label — no BodyStructure, Cell, or Protein means no
+# secretes, part_of, located_in, catalyzes or converts_to. Run
+# `python run.py --ontology-check` after installing to see the reachable set.
+#
+# Cost of the second model: roughly +90 MB on disk and a second NER pass over
+# every chunk, so Stage 2 takes about twice as long. Spans from both are merged
+# by offset (see stage2_extract.merge_entities).
+en_ner_bc5cdr_md @ https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bc5cdr_md-0.5.4.tar.gz
+en_ner_bionlp13cg_md @ https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bionlp13cg_md-0.5.4.tar.gz
+
+# --- Stage 2: LLM relation/modifier extraction (Claude backend) ---
+anthropic>=0.40
+
+# --- Stage 3: SapBERT + FAISS entity linking ---
+torch>=2.1
+transformers>=4.40
+faiss-cpu>=1.8          # on macOS prefer `conda install -c pytorch faiss-cpu` (see README segfault note)
+tqdm>=4.66              # optional: progress bar for build_index.py (degrades gracefully if absent)
+
+# --- Optional: self-hosted Meditron backend (Stage 2 / Stage 3 rerank) ---
+openai>=1.30            # talks to your vLLM OpenAI-compatible endpoint
+
+# --- Optional: SHACL shape validation before assertion (Stage 6) ---
+pyshacl>=0.25

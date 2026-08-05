@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medkg"
+version = "0.1.0"
+description = "Staged medical knowledge-graph construction pipeline (Stages 2–8)"
+readme = "README.md"
+# Hard bound: the pinned scispaCy 0.5.4 stack (scipy 1.9.x, nmslib) has no wheels
+# for Python 3.12, and scispaCy 0.5.5+ (which supports 3.12) shipped no matching
+# models. So this project targets 3.9–3.11; 3.11 is recommended.
+requires-python = ">=3.9,<3.12"
+
+dependencies = [
+    # Core graph stack (enough for the offline `from-stage3` demo)
+    "rdflib>=7.0",
+    "owlrl>=6.0",
+    "numpy>=1.24,<2",            # 1.x for the scispaCy/spaCy stack; dodges faiss numpy-2 ABI segfault
+    # Stage 2 — NER + negation (scispaCy and its model must match; 0.5.4 for py<=3.11)
+    "spacy>=3.7,<3.8",
+    "scispacy==0.5.4",
+    "negspacy>=1.0",
+    # Both models are required: bc5cdr alone emits only DISEASE and CHEMICAL,
+    # which leaves 9 of 27 relation types with no reachable head or tail label.
+    "en_ner_bc5cdr_md @ https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bc5cdr_md-0.5.4.tar.gz",
+    "en_ner_bionlp13cg_md @ https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bionlp13cg_md-0.5.4.tar.gz",
+    # Stage 2 — LLM relation/modifier extraction (Claude)
+    "anthropic>=0.40",
+    # Stage 3 — SapBERT + FAISS entity linking
+    "torch>=2.1",
+    "transformers>=4.40",
+    "faiss-cpu>=1.8",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+meditron = ["openai>=1.30"]     # self-hosted Meditron via a vLLM OpenAI-compatible endpoint
+shacl = ["pyshacl>=0.25"]       # SHACL validation before Stage 6 assertion
+
+[tool.setuptools]
+packages = ["medkg"]

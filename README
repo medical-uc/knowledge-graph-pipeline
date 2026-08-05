@@ -1,0 +1,58 @@
+Medical Knowledge Graph (MedKG)
+
+The LLM back-end of the project defaults to an OpenAI-compatible call to
+`http://jupyter-02.aml1.id.iosda.org:8888`. There are two back-ends available to
+use with the source code: `huatuogpt-o1-72b-4bit` and `meditron3-8b-gguf`.
+
+This project uses Python 3.11, so make sure to have it installed on your device.
+Create the virtual environment by running:
+
+  python3.11 -m venv .venv
+
+After that, activate it by running:
+
+  source .venv/bin/activate
+
+To install all the dependencies:
+
+  pip install -r requirements.txt
+
+This project also depends on a pre-built UMLS index, which is built using
+`build_index.py`. It processes `MRCONSO.RFF` and turns it into embeddings. You
+can obtain the UMLS file through:
+
+  https://www.nlm.nih.gov/research/umls/licensedcontent/umlsknowledgesources.html
+
+and clicking on the link specified as `MRCONSO.RFF`. Point `build_index.py` to
+the `MRCONSO.RFF` file and an index directory should be generated.
+
+To run the pipeline:
+
+  python run.py --mode full \
+    --input input_document.md \
+    --index-dir umls_index/ \
+    --llm {claude|meditron|huatuo} \
+    --ner en_ner_bc5cdr_md,en_ner_bionlp13cg_md
+
+Here, `input_document.md` is a document that follows the format specified in
+
+  https://github.com/medical-uc/document-rewriter
+
+That repository also specifies how to run the rewriting pipeline, which converts
+a messy medical school material document into an organized one that this
+pipeline can process easily.
+
+To query the resulting `.nq` knowledge graph for, e.g., all the relations that
+were built by the pipeline, run:
+
+  python query.py artifacts/graph.nq relations
+
+The command
+
+  python query.py graph.nq --list
+
+should give you a list of what you can do with the querying script.
+
+To generate the MCQ questions, run something like:
+
+  python mcq.py artifacts/graph.ir.json --llm huatuo --out artifacts/questions.json

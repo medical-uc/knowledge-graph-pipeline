@@ -1,0 +1,650 @@
+{
+  "version": "medkg-medschool-3",
+  "notes": [
+    "Relation types and modifiers, loaded by medkg.config. Override with",
+    "MEDKG_ONTOLOGY=/path/to/ontology.json or run.py --ontology.",
+    "",
+    "Every relation's head/tail refers to a SPAN LABEL, and a span label only",
+    "exists if some configured NER model emits it. `ner_models` below is the",
+    "map from each model's raw labels onto this ontology's vocabulary; a",
+    "relation whose head or tail is not reachable from ANY configured model can",
+    "never fire, however well phrased its gloss. `medkg.ontology.validate`",
+    "reports exactly that, and it is the first thing to check when extraction",
+    "yield is low.",
+    "",
+    "`uri` uses CURIEs expanded by medkg.ontology: ont: sct: rxn:.",
+    "`source` names the external vocabulary the type corresponds to. Where a",
+    "numeric identifier is not stated it has deliberately NOT been guessed --",
+    "build_ontology.py --from-srdef fills real UMLS Semantic Network",
+    "identifiers in from your own NET/SRDEF and NET/SRSTRE2 files.",
+    "",
+    "`subPropertyOf` names a more general relation type. Stage 2 asserts only",
+    "the most specific type that fits and drops the parent (guards.",
+    "prune_subsumed_relations); Stage 7 emits the rdfs:subPropertyOf axiom and",
+    "materializes the parent into urn:graph:inferred, so the general fact stays",
+    "queryable but is marked derived rather than claimed.",
+    "",
+    "`label_hierarchy` maps a span label to a more general one. A head/tail",
+    "constraint is satisfied by the label itself or any ancestor, so a type set",
+    "can be written once in general terms instead of enumerating every NER",
+    "vocabulary that might reach it.",
+    "",
+    "`aliases` are other names for the SAME relation; `inverseOf` are names for",
+    "the relation read from the other end, and Stage 2 accepts them by swapping",
+    "head and tail. Extractors reach for an inverse when the menu only offers one",
+    "direction -- a run produced produced_by, stored_in, required_for and",
+    "affected_by, all of which were discarded as unknown types.",
+    "",
+    "`catalyzes` takes a Protein head, not any Substance: catalysis is done by",
+    "enzymes, and the looser set let T3 and iodine through once Drug became a",
+    "kind of Substance. A type constraint that contradicts its own gloss is a",
+    "bug in the constraint."
+  ],
+  "ner_models": {
+    "en_ner_bc5cdr_md": {
+      "DISEASE": "Disease",
+      "CHEMICAL": "Drug"
+    },
+    "en_ner_bionlp13cg_md": {
+      "CANCER": "Disease",
+      "ORGAN": "BodyStructure",
+      "TISSUE": "BodyStructure",
+      "ANATOMICAL_SYSTEM": "BodyStructure",
+      "MULTI-TISSUE_STRUCTURE": "BodyStructure",
+      "ORGANISM_SUBDIVISION": "BodyStructure",
+      "IMMATERIAL_ANATOMICAL_ENTITY": "BodyStructure",
+      "DEVELOPING_ANATOMICAL_STRUCTURE": "BodyStructure",
+      "CELL": "Cell",
+      "CELLULAR_COMPONENT": "CellComponent",
+      "SIMPLE_CHEMICAL": "Substance",
+      "AMINO_ACID": "Substance",
+      "ORGANISM_SUBSTANCE": "Substance",
+      "GENE_OR_GENE_PRODUCT": "Protein",
+      "ORGANISM": "Organism",
+      "PATHOLOGICAL_FORMATION": "Morphology",
+      "MULTI_TISSUE_STRUCTURE": "BodyStructure"
+    }
+  },
+  "relations": {
+    "treated_with": {
+      "head": [
+        "Disease"
+      ],
+      "tail": [
+        "Drug",
+        "Substance"
+      ],
+      "uri": "ont:treated_with",
+      "source": "UMLS-SN: may_be_treated_by",
+      "gloss": "HEAD is the disease, TAIL is the drug. 'X treated_with Y' means Y TREATS X.",
+      "symmetric": false,
+      "inverseOf": [
+        "treats"
+      ]
+    },
+    "prevented_by": {
+      "head": [
+        "Disease"
+      ],
+      "tail": [
+        "Drug",
+        "Substance"
+      ],
+      "uri": "ont:prevented_by",
+      "source": "UMLS-SN: may_be_prevented_by",
+      "gloss": "HEAD is the disease, TAIL is the drug. 'X prevented_by Y' means Y PREVENTS X.",
+      "symmetric": false
+    },
+    "caused_by": {
+      "head": [
+        "Disease",
+        "Finding",
+        "Morphology"
+      ],
+      "tail": [
+        "Disease",
+        "Finding",
+        "BodyStructure",
+        "Substance",
+        "Organism",
+        "Protein"
+      ],
+      "uri": "ont:caused_by",
+      "source": "UMLS-SN: caused_by",
+      "gloss": "HEAD is the EFFECT, TAIL is the CAUSE. 'X caused_by Y' means Y CAUSES X. For 'hyperthyroidism leads to osteoporosis', write osteoporosis caused_by hyperthyroidism -- NOT the reverse. This holds for NOMINAL phrasing too: 'Graves' disease is a frequent cause of hyperthyroidism' is hyperthyroidism caused_by Graves' disease, and 'the most common cause is Hashimoto's' puts Hashimoto's in the TAIL. If the cause is an abnormal amount of something ('a deficiency in dietary iodine', 'an excess of thyroid hormones'), the tail needs a `deviation` modifier -- iodine alone as the tail says iodine causes goiter, which is the opposite of the truth.",
+      "inverse_of": "causes",
+      "symmetric": false,
+      "inverseOf": [
+        "causes",
+        "leads_to",
+        "results_in"
+      ]
+    },
+    "finding_site": {
+      "head": [
+        "Finding",
+        "Symptom",
+        "Disease",
+        "Morphology"
+      ],
+      "tail": [
+        "BodyStructure",
+        "Cell",
+        "CellComponent"
+      ],
+      "uri": "ont:finding_site",
+      "source": "SNOMED CT attribute Finding site (363698007), given a local URI so it does not collide with the post-coordination attribute of the same name",
+      "gloss": "HEAD is the finding, TAIL is the anatomical site. 'X finding_site Y' means X OCCURS AT Y.",
+      "symmetric": false
+    },
+    "associated_with": {
+      "head": [
+        "Disease",
+        "Finding",
+        "Symptom"
+      ],
+      "tail": [
+        "Disease",
+        "Finding",
+        "Symptom",
+        "BodyStructure",
+        "Substance"
+      ],
+      "uri": "ont:associated_with",
+      "source": "UMLS-SN: associated_with",
+      "gloss": "Symmetric. Use only when no directional type fits; prefer a specific type.",
+      "symmetric": true
+    },
+    "present_in_patient": {
+      "head": [
+        "Disease",
+        "Finding",
+        "Symptom"
+      ],
+      "tail": null,
+      "uri": "ont:present_in_patient",
+      "source": "local",
+      "gloss": "Unary: HEAD is present in the patient. No tail."
+    },
+    "part_of": {
+      "head": [
+        "BodyStructure",
+        "Cell",
+        "CellComponent"
+      ],
+      "tail": [
+        "BodyStructure",
+        "Cell",
+        "AnatomicalSystem"
+      ],
+      "uri": "ont:part_of",
+      "source": "RO: part of; UMLS-SN: part_of",
+      "gloss": "HEAD is the PART, TAIL is the WHOLE. 'X part_of Y' means X IS A COMPONENT OF Y. The isthmus is part_of the thyroid gland.",
+      "symmetric": false,
+      "inverseOf": [
+        "has_part",
+        "consists_of"
+      ]
+    },
+    "located_in": {
+      "head": [
+        "BodyStructure",
+        "Cell",
+        "CellComponent",
+        "Substance"
+      ],
+      "tail": [
+        "BodyStructure",
+        "Cell"
+      ],
+      "uri": "ont:located_in",
+      "source": "RO: located in; UMLS-SN: location_of",
+      "gloss": "HEAD is the thing located, TAIL is the place. 'X located_in Y' means X SITS IN Y.",
+      "symmetric": false,
+      "inverseOf": [
+        "contains",
+        "location_of"
+      ]
+    },
+    "composed_of": {
+      "head": [
+        "BodyStructure"
+      ],
+      "tail": [
+        "Cell",
+        "BodyStructure",
+        "Substance"
+      ],
+      "uri": "ont:composed_of",
+      "source": "UMLS-SN: consists_of",
+      "gloss": "HEAD is the WHOLE, TAIL is the MATERIAL. Opposite direction to part_of.",
+      "symmetric": false
+    },
+    "connects_to": {
+      "head": [
+        "BodyStructure"
+      ],
+      "tail": [
+        "BodyStructure"
+      ],
+      "uri": "ont:connects_to",
+      "source": "RO: connected to",
+      "gloss": "Symmetric anatomical continuity.",
+      "symmetric": true
+    },
+    "secretes": {
+      "head": [
+        "BodyStructure",
+        "Cell"
+      ],
+      "tail": [
+        "Substance",
+        "Protein"
+      ],
+      "uri": "ont:secretes",
+      "source": "RO: secretes; UMLS-SN: produces",
+      "gloss": "HEAD is the gland or cell, TAIL is the substance. 'X secretes Y' means X RELEASES Y.",
+      "symmetric": false,
+      "aliases": [
+        "produces",
+        "releases"
+      ],
+      "inverseOf": [
+        "produced_by",
+        "secreted_by",
+        "released_by"
+      ]
+    },
+    "synthesizes": {
+      "head": [
+        "BodyStructure",
+        "Cell",
+        "CellComponent",
+        "Protein"
+      ],
+      "tail": [
+        "Substance",
+        "Protein"
+      ],
+      "uri": "ont:synthesizes",
+      "source": "UMLS-SN: produces",
+      "gloss": "HEAD is the producer, TAIL is the product made.",
+      "symmetric": false,
+      "aliases": [
+        "makes"
+      ],
+      "inverseOf": [
+        "synthesized_by"
+      ]
+    },
+    "stores": {
+      "head": [
+        "BodyStructure",
+        "Cell",
+        "CellComponent"
+      ],
+      "tail": [
+        "Substance",
+        "Protein"
+      ],
+      "uri": "ont:stores",
+      "source": "local",
+      "gloss": "HEAD is the store, TAIL is the substance held.",
+      "symmetric": false,
+      "aliases": [
+        "holds"
+      ],
+      "inverseOf": [
+        "stored_in"
+      ]
+    },
+    "transports": {
+      "head": [
+        "BodyStructure",
+        "Cell",
+        "Protein",
+        "Substance"
+      ],
+      "tail": [
+        "Substance",
+        "Protein"
+      ],
+      "uri": "ont:transports",
+      "source": "RO: transports",
+      "gloss": "HEAD is the CARRIER, TAIL is the CARGO. 'TBG transports thyroxine' -- the cargo is the hormone, never the medium it travels through.",
+      "symmetric": false,
+      "aliases": [
+        "carries"
+      ],
+      "inverseOf": [
+        "transported_by",
+        "carried_by"
+      ]
+    },
+    "converts_to": {
+      "head": [
+        "Substance",
+        "Protein"
+      ],
+      "tail": [
+        "Substance",
+        "Protein"
+      ],
+      "uri": "ont:converts_to",
+      "source": "local (RO: has output, restricted)",
+      "gloss": "HEAD is the PRECURSOR, TAIL is the PRODUCT. 'T4 converts_to T3', because T4 becomes T3.",
+      "symmetric": false,
+      "inverseOf": [
+        "converted_from",
+        "derived_from"
+      ]
+    },
+    "catalyzes": {
+      "head": [
+        "Protein"
+      ],
+      "tail": [
+        "Substance",
+        "Protein"
+      ],
+      "uri": "ont:catalyzes",
+      "source": "RO: catalyzes",
+      "gloss": "HEAD is the ENZYME, TAIL is the reaction's substrate or product -- never an atom or group transferred within it. For 'deiodinases catalyze the conversion of T4 to T3 by removing iodine atoms' the tail is T4 or T3, not iodine.",
+      "symmetric": false,
+      "aliases": [
+        "breaks_down",
+        "metabolizes"
+      ],
+      "inverseOf": [
+        "catalyzed_by",
+        "broken_down_by"
+      ]
+    },
+    "regulates": {
+      "head": [
+        "BodyStructure",
+        "Cell",
+        "Substance",
+        "Protein"
+      ],
+      "tail": [
+        "BodyStructure",
+        "Cell",
+        "Substance",
+        "Protein",
+        "Finding"
+      ],
+      "uri": "ont:regulates",
+      "source": "RO: regulates",
+      "gloss": "HEAD is the REGULATOR, TAIL is what is controlled. Use ONLY when the direction of effect is unstated; if the text says increases or decreases, emit stimulates or inhibits instead. Both are subPropertyOf regulates, so the general fact is inferred and does not need asserting.",
+      "symmetric": false,
+      "aliases": [
+        "acts_on",
+        "affects",
+        "modulates"
+      ],
+      "inverseOf": [
+        "affected_by",
+        "regulated_by"
+      ]
+    },
+    "stimulates": {
+      "head": [
+        "BodyStructure",
+        "Cell",
+        "Substance",
+        "Protein"
+      ],
+      "tail": [
+        "BodyStructure",
+        "Cell",
+        "Substance",
+        "Protein",
+        "Finding"
+      ],
+      "uri": "ont:stimulates",
+      "source": "RO: positively regulates",
+      "gloss": "HEAD is the STIMULATOR, TAIL is what is increased. 'TSH stimulates the thyroid gland'.",
+      "symmetric": false,
+      "subPropertyOf": "regulates",
+      "aliases": [
+        "activates"
+      ],
+      "inverseOf": [
+        "stimulated_by",
+        "activated_by"
+      ]
+    },
+    "inhibits": {
+      "head": [
+        "BodyStructure",
+        "Cell",
+        "Substance",
+        "Protein",
+        "Drug"
+      ],
+      "tail": [
+        "BodyStructure",
+        "Cell",
+        "Substance",
+        "Protein",
+        "Finding"
+      ],
+      "uri": "ont:inhibits",
+      "source": "RO: negatively regulates",
+      "gloss": "HEAD is the INHIBITOR, TAIL is what is decreased. 'calcitonin inhibits bone resorption' -- the tail is the PROCESS (resorption), not the organ it happens in. If only the organ can be tagged, omit the relation.",
+      "symmetric": false,
+      "subPropertyOf": "regulates",
+      "inverseOf": [
+        "inhibited_by"
+      ]
+    },
+    "requires": {
+      "head": [
+        "BodyStructure",
+        "Cell",
+        "Protein",
+        "Substance"
+      ],
+      "tail": [
+        "Substance",
+        "Protein"
+      ],
+      "uri": "ont:requires",
+      "source": "local",
+      "gloss": "HEAD is the dependent process or structure, TAIL is what it needs.",
+      "symmetric": false,
+      "inverseOf": [
+        "required_for",
+        "needed_for"
+      ]
+    },
+    "has_function": {
+      "head": [
+        "BodyStructure",
+        "Cell",
+        "Substance",
+        "Protein"
+      ],
+      "tail": [
+        "Finding"
+      ],
+      "uri": "ont:has_function",
+      "source": "UMLS-SN: functionally_related_to",
+      "gloss": "HEAD is the structure or substance, TAIL is the process it performs.",
+      "symmetric": false
+    },
+    "risk_factor_for": {
+      "head": [
+        "Disease",
+        "Finding",
+        "Substance",
+        "Drug"
+      ],
+      "tail": [
+        "Disease"
+      ],
+      "uri": "ont:risk_factor_for",
+      "source": "UMLS-SN: predisposes",
+      "gloss": "HEAD is the RISK FACTOR, TAIL is the DISEASE it predisposes to. Note this is the OPPOSITE direction to caused_by.",
+      "symmetric": false
+    },
+    "complication_of": {
+      "head": [
+        "Disease",
+        "Finding"
+      ],
+      "tail": [
+        "Disease"
+      ],
+      "uri": "ont:complication_of",
+      "source": "UMLS-SN: complicates",
+      "gloss": "HEAD is the COMPLICATION, TAIL is the underlying disease. 'myxedema complication_of hypothyroidism'. Prefer this over caused_by whenever the head is a downstream state of an untreated or progressing disease; it is subPropertyOf caused_by, so caused_by is inferred anyway.",
+      "symmetric": false,
+      "subPropertyOf": "caused_by"
+    },
+    "diagnosed_by": {
+      "head": [
+        "Disease",
+        "Finding"
+      ],
+      "tail": [
+        "Finding",
+        "Substance"
+      ],
+      "uri": "ont:diagnosed_by",
+      "source": "UMLS-SN: diagnosed_by",
+      "gloss": "HEAD is the disease, TAIL is the test or sign that establishes it.",
+      "symmetric": false
+    },
+    "adverse_effect_of": {
+      "head": [
+        "Disease",
+        "Finding",
+        "Symptom"
+      ],
+      "tail": [
+        "Drug",
+        "Substance"
+      ],
+      "uri": "ont:adverse_effect_of",
+      "source": "UMLS-SN: adverse_effect_of",
+      "gloss": "HEAD is the HARM, TAIL is the DRUG that caused it.",
+      "symmetric": false
+    },
+    "contraindicated_in": {
+      "head": [
+        "Drug",
+        "Substance"
+      ],
+      "tail": [
+        "Disease",
+        "Finding"
+      ],
+      "uri": "ont:contraindicated_in",
+      "source": "UMLS-SN: contraindicated_with",
+      "gloss": "HEAD is the DRUG, TAIL is the condition in which it must not be given.",
+      "symmetric": false
+    },
+    "has_mechanism": {
+      "head": [
+        "Drug",
+        "Substance"
+      ],
+      "tail": [
+        "Protein",
+        "Substance",
+        "Cell",
+        "CellComponent"
+      ],
+      "uri": "ont:has_mechanism",
+      "source": "UMLS-SN: mechanism_of_action_of",
+      "gloss": "HEAD is the drug, TAIL is the molecular target it acts through.",
+      "symmetric": false
+    }
+  },
+  "modifiers": {
+    "severity": {
+      "uri": "sct:246112005",
+      "source": "SNOMED attribute: Severity (verified)"
+    },
+    "deviation": {
+      "uri": "ont:hasDeviation",
+      "source": "local; map to a SNOMED qualifier value in production -- no identifier is guessed here (see HANDOFF 9.7)",
+      "gloss": "Direction of abnormality for a substance, hormone or process: deficiency, excess or resistance. THE MOST IMPORTANT MODIFIER IN THIS FILE -- it is the difference between 'iodine causes goiter' and 'iodine deficiency causes goiter'. Extract it whenever the text says deficiency, insufficient, lack of, excess, excessive, elevated, too much/little, over- or underproduction."
+    },
+    "location": {
+      "uri": "sct:363698007",
+      "source": "SNOMED attribute: Finding site (verified)"
+    },
+    "laterality": {
+      "uri": "sct:272741003",
+      "source": "SNOMED attribute: Laterality (verified)"
+    },
+    "acuity": {
+      "uri": "ont:hasAcuity",
+      "source": "map to SNOMED Clinical course in production"
+    },
+    "radiation": {
+      "uri": "ont:radiatesTo",
+      "source": "no single SNOMED attribute; local"
+    },
+    "temporality": {
+      "uri": "ont:hasTemporality",
+      "source": "local",
+      "gloss": "Onset/duration/stage, e.g. 'during fetal development'."
+    },
+    "quantity": {
+      "uri": "ont:hasQuantity",
+      "source": "local",
+      "gloss": "Dose, concentration or amount, e.g. '8-10 mg', '115 ug/d'."
+    },
+    "frequency": {
+      "uri": "ont:hasFrequency",
+      "source": "local",
+      "gloss": "How often, e.g. 'daily'."
+    },
+    "route": {
+      "uri": "ont:hasRoute",
+      "source": "map to SNOMED Route of administration",
+      "gloss": "Administration route, e.g. 'oral'."
+    }
+  },
+  "modifier_values": {
+    "severe": "sct:24484000",
+    "moderate": "sct:6736007",
+    "mild": "sct:255604002",
+    "acute": "sct:424124008",
+    "substernal": "sct:51185008",
+    "left arm": "sct:368208006",
+    "deficiency": "ont:Deficiency",
+    "deficiencies": "ont:Deficiency",
+    "deficient": "ont:Deficiency",
+    "insufficient": "ont:Deficiency",
+    "insufficiency": "ont:Deficiency",
+    "inadequate": "ont:Deficiency",
+    "lack of": "ont:Deficiency",
+    "depletion": "ont:Deficiency",
+    "underproduction": "ont:Deficiency",
+    "hyposecretion": "ont:Deficiency",
+    "too little": "ont:Deficiency",
+    "low": "ont:Deficiency",
+    "excess": "ont:Excess",
+    "excessive": "ont:Excess",
+    "excessively": "ont:Excess",
+    "elevated": "ont:Excess",
+    "raised": "ont:Excess",
+    "overproduction": "ont:Excess",
+    "hypersecretion": "ont:Excess",
+    "too much": "ont:Excess",
+    "high": "ont:Excess",
+    "resistance": "ont:Resistance",
+    "resistant": "ont:Resistance",
+    "unresponsive": "ont:Resistance"
+  },
+  "label_hierarchy": {
+    "Drug": "Substance",
+    "MultiTissueStructure": "BodyStructure",
+    "AnatomicalSystem": "BodyStructure"
+  }
+}
