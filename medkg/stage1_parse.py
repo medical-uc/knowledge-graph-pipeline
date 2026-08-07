@@ -44,11 +44,13 @@ from __future__ import annotations
 import itertools
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from .ir import Document, Source, Chunk, Figure, Passage
 from . import config
+from . import console
 
 # ---------------------------------------------------------------------------
 # Tolerant tag scanner
@@ -220,6 +222,17 @@ def lift_anchors(text: str) -> tuple[str, list[str]]:
     return cleaned.strip(), ids
 
 
+def slug(text: str, max_len: int = 48) -> str:
+    """A URI-safe, human-readable identifier: 'Thyroid Hormones' -> 'thyroid-hormones'.
+
+    Used for section and group ids that end up inside a graph URI, so it is
+    restricted to characters that survive N-Quads and a shell argument without
+    quoting — a scope you cannot type is a scope you cannot extract.
+    """
+    out = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return out[:max_len].rstrip("-")
+
+
 def parse_src(line: str) -> dict:
     """`source: x.md | figures: 33 | model: huatuo... | generated: ...` -> dict."""
     out: dict = {}
@@ -252,6 +265,7 @@ class _Segment:
     figure_ref: Optional[str] = None
     figure_refs: list[str] = field(default_factory=list)
     heading_level: int = 0
+    section_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +282,14 @@ def _walk_section(sec: Node, path: list[str], segs: list[_Segment],
     except ValueError:
         level = 2
     here = path + ([title] if title else [])
+    # A section with no id of its own still has to be addressable, or its
+    # content would fall back into the document-level graph and become
+    # unreachable by a section subset. The heading slug is stable enough for
+    # that, and `sections()` reports whatever is used either way.
+    sid = sid or slug(title)
     if title:
-        segs.append(_Segment("heading", title, here, heading_level=level))
+        segs.append(_Segment("heading", title, here, heading_level=level,
+                             section_id=sid))
 
     for child in sec.children:
         tag = child.tag
@@ -285,7 +305,7 @@ def _walk_section(sec: Node, path: list[str], segs: list[_Segment],
                                "planned": clean_text(child.flat_text())[:300]})
             continue
         if tag == "fig":
-            _collect_figure(child, here, segs, figures, review)
+            _collect_figure(child, here, segs, figures, review, section_id=sid)
             continue
 
         kind = TAG_KIND.get(tag)
@@ -307,11 +327,13 @@ def _walk_section(sec: Node, path: list[str], segs: list[_Segment],
             continue
         body, anchors = lift_anchors(body)
         if body:
-            segs.append(_Segment(kind, body, here, figure_refs=anchors))
+            segs.append(_Segment(kind, body, here, figure_refs=anchors,
+                                 section_id=sid))
 
 
 def _collect_figure(node: Node, path: list[str], segs: list[_Segment],
-                    figures: list[Figure], review: list[dict]) -> None:
+                    figures: list[Figure], review: list[dict],
+                    section_id: str = "") -> None:
     fid = node.attrs.get("id", "").strip()
     marker = ""
     body = node.text or ""
@@ -329,15 +351,17 @@ def _collect_figure(node: Node, path: list[str], segs: list[_Segment],
     desc = clean_text(desc_node.flat_text()) if desc_node else ""
 
     segs.append(_Segment("figure_marker", marker or f"[FIGURE:{fid}]", path,
-                         figure_ref=fid))
+                         figure_ref=fid, section_id=section_id))
     if caption:
-        segs.append(_Segment("caption", caption, path, figure_ref=fid))
+        segs.append(_Segment("caption", caption, path, figure_ref=fid,
+                             section_id=section_id))
     if desc:
-        segs.append(_Segment("figure_description", desc, path, figure_ref=fid))
+        segs.append(_Segment("figure_description", desc, path, figure_ref=fid,
+                             section_id=section_id))
 
     figures.append(Figure(fig_id=fid, image_path="", caption=caption,
                           referenced_from="", marker=marker or f"[FIGURE:{fid}]",
-                          description=desc))
+                          description=desc, section_id=section_id))
 
 
 def build_segments(root: Node, review: list[dict]) -> tuple[list[_Segment], list[Figure], Source]:
@@ -416,6 +440,7 @@ def _merge(segs: list[_Segment], max_chars: int) -> list[list[_Segment]]:
         prev = groups[-1][0] if groups else None
         if (prev and s.kind == prev.kind and s.kind in config.CHUNK_KINDS
                 and prev.section_path == s.section_path
+                and prev.section_id == s.section_id
                 and sum(len(x.text) + 2 for x in groups[-1]) + len(s.text) <= max_chars):
             groups[-1].append(s)
         else:
@@ -458,7 +483,8 @@ def assemble(segs: list[_Segment], review: Optional[list] = None,
             passages.append(Passage(
                 passage_id=f"p{next(pcounter):03d}", kind=head.kind, text=text,
                 char_start=start, char_end=end,
-                section_path=list(head.section_path)))
+                section_path=list(head.section_path),
+                section_id=head.section_id))
             continue
         kind = head.kind
         # The rewriter's <key> often restates <con> verbatim, and in the sample
@@ -476,6 +502,7 @@ def assemble(segs: list[_Segment], review: Optional[list] = None,
             chunk_id=cid, text=text, char_start=start, char_end=end,
             section_path=list(head.section_path), kind=kind,
             figure_refs=sorted({r for s in group for r in s.figure_refs}),
+            section_id=head.section_id,
         ))
     return w.value(), chunks, passages, fig_spans
 
@@ -524,8 +551,13 @@ def parse_file(md_path: str, *, normalized_path: str = None, doc_id: str = None,
                source: Source = None, figures_dir: str = "", figures_ext: str = "",
                verify_images: bool = False) -> Document:
     """Tagged rewritten markdown -> normalized text file + Stage-1 Document."""
+    started_at = time.time()
+    console.announce_stage(1, "parse",
+                           "tagged markdown -> normalized text + IR")
+    console.announce_step(f"reading {md_path}")
     with open(md_path, encoding="utf-8") as fh:
         raw = fh.read()
+    console.announce_detail(console.format_count(len(raw), "character"))
 
     stem = os.path.splitext(os.path.basename(md_path))[0]
     # Written into the artifacts directory rather than beside the source: the
@@ -534,13 +566,42 @@ def parse_file(md_path: str, *, normalized_path: str = None, doc_id: str = None,
     normalized_path = normalized_path or config.artifact_path(
         stem + ".normalized.md")
 
+    console.announce_step("scanning for rewriter markers and failed sections")
     review: list[dict] = scan_markers(raw)
+    console.announce_detail(console.format_count(len(review), "marker")
+                            + " flagged for review")
+
+    console.announce_step("parsing tags into sections, figures and segments")
     root = parse_tagged(raw)
     segs, figures, parsed_source = build_segments(root, review)
+    console.announce_detail(f"{console.format_count(len(segs), 'segment')}, "
+                            f"{console.format_count(len(figures), 'figure')}")
+
+    console.announce_step(
+        f"assembling chunks (same-kind runs merge up to "
+        f"{config.MAX_CHUNK_CHARS:,} characters)")
     normalized, chunks, passages, fig_spans = assemble(segs, review)
+    kind_counts: dict[str, int] = {}
+    for chunk in chunks:
+        kind_counts[chunk.kind] = kind_counts.get(chunk.kind, 0) + 1
+    console.announce_detail(
+        f"{console.format_count(len(chunks), 'chunk')} for Stage 2: "
+        + ", ".join(f"{kind} {count}"
+                    for kind, count in sorted(kind_counts.items())))
+    passage_counts: dict[str, int] = {}
+    for passage in passages:
+        passage_counts[passage.kind] = passage_counts.get(passage.kind, 0) + 1
+    console.announce_detail(
+        f"{console.format_count(len(passages), 'passage')} kept but never "
+        f"asserted: "
+        + ", ".join(f"{kind} {count}"
+                    for kind, count in sorted(passage_counts.items())))
+
+    console.announce_step("binding figure markers to their chunks")
     _bind_figures(figures, chunks, fig_spans, figures_dir, figures_ext,
                   verify_images, review)
 
+    console.announce_step(f"writing normalized text -> {normalized_path}")
     with open(normalized_path, "w", encoding="utf-8") as fh:
         fh.write(normalized)
 
@@ -553,6 +614,7 @@ def parse_file(md_path: str, *, normalized_path: str = None, doc_id: str = None,
         source_path=os.path.abspath(md_path),
         normalized_path=os.path.abspath(normalized_path),
     )
+    console.announce_step("verifying every offset against the normalized text")
     for item in list(doc.chunks) + list(doc.passages):
         assert normalized[item.char_start:item.char_end] == item.text, "offset drift"
     for fig in doc.figures:
@@ -561,6 +623,11 @@ def parse_file(md_path: str, *, normalized_path: str = None, doc_id: str = None,
             if span:
                 assert normalized[span[0]:span[1]] == text, \
                     f"offset drift in figure {fig.fig_id}"
+    console.announce_finished(
+        "stage 1", started_at,
+        f"{src.source_id}, "
+        f"{console.format_count(len(doc.sections()), 'section')}, "
+        f"{console.format_count(len(chunks), 'chunk')}")
     return doc
 
 

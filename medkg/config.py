@@ -19,6 +19,7 @@ ONT    = "http://example.org/medkg/ont#"
 INST   = "http://example.org/medkg/inst/"
 GRAPH  = "urn:graph:"
 DCTERMS = "http://purl.org/dc/terms/"
+GROUP  = "urn:group:"
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 RDFS_SUBCLASS = "http://www.w3.org/2000/01/rdf-schema#subClassOf"
 RDFS_LABEL    = "http://www.w3.org/2000/01/rdf-schema#label"
@@ -121,6 +122,40 @@ NER_MODELS: tuple = tuple(
 SEVERITY_WORDS = {"severe", "mild", "moderate", "marked", "slight"}
 ACUITY_WORDS = {"acute", "chronic", "subacute"}
 LOCATION_WORDS = {"substernal", "retrosternal", "epigastric", "precordial"}
+
+# --- The graphs that are ABOUT the corpus rather than part of it -------------
+# Asserted facts live in one graph per (document, section) -- see
+# `stage6_assert.graph_for` -- so a section, a document or a group of documents
+# can be lifted out as a set of graphs rather than reconstructed by query. These
+# four are the exceptions: they describe the corpus, hold what is true of it
+# corpus-wide, or hold what the reasoner derived, and none of them belongs to a
+# single section.
+#
+#   provenance  what each document is and what model wrote its prose
+#   catalog     the document/section/group structure a subset is selected BY
+#   labels      one rdfs:label + mentionCount per concept, aggregated over every
+#               document. Per-document labels would give a concept mentioned in
+#               three documents three labels, and every relation row would come
+#               back three times.
+#   inferred    Stage 7's materialized closure
+GRAPH_PROVENANCE = GRAPH + "provenance"
+GRAPH_CATALOG    = GRAPH + "catalog"
+GRAPH_LABELS     = GRAPH + "labels"
+GRAPH_INFERRED   = GRAPH + "inferred"
+# Graphs a subset always carries: without labels every answer is a bare URI, and
+# without the catalog the extracted file cannot say what it is a subset OF.
+CORPUS_GRAPHS = (GRAPH_PROVENANCE, GRAPH_CATALOG, GRAPH_LABELS, GRAPH_INFERRED)
+
+# Catalog vocabulary.
+DOCUMENT_CLASS  = ONT + "Document"
+SECTION_CLASS   = ONT + "Section"
+GROUP_CLASS     = ONT + "DocumentGroup"
+HAS_SECTION     = ONT + "hasSection"
+IN_DOCUMENT     = ONT + "inDocument"
+HAS_MEMBER      = ONT + "hasMember"
+SECTION_PATH    = ONT + "sectionPath"
+SECTION_ORDER   = ONT + "sectionOrder"
+FROM_SECTION    = ONT + "fromSection"
 
 PROV               = "http://www.w3.org/ns/prov#"
 WAS_GENERATED_BY   = PROV + "wasGeneratedBy"

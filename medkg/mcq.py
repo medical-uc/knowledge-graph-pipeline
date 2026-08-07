@@ -47,6 +47,7 @@ from typing import Optional
 
 from .ir import Document
 from . import config
+from . import console
 from . import stage4_postcoord as s4
 from . import guards
 
@@ -325,7 +326,11 @@ def phrase_items(items: list[Item], call_llm, batch: int = 10) -> list[dict]:
     """Rewrite stems in batches. Returns the rejections, for reporting."""
     rejected = []
     by_id = {i.item_id: i for i in items}
-    for start in range(0, len(items), batch):
+    starts = list(range(0, len(items), batch))
+    console.announce_step(
+        f"rephrasing {console.format_count(len(items), 'stem')} in "
+        f"{len(starts)} LLM call(s) of up to {batch}")
+    for start in console.with_progress(starts, "batches rephrased"):
         group = items[start:start + batch]
         raw = call_llm(_PHRASE_SYSTEM, phrase_prompt(group), None)
         for entry in _parse(raw):
@@ -352,7 +357,17 @@ def _parse(text: str) -> list[dict]:
 
 
 def generate(doc: Document, call_llm=None) -> tuple[list[Item], list[dict]]:
+    """Build items, then optionally rephrase their stems with `call_llm`.
+
+    Returns (items, rejected_rewrites). Without a backend the templated stems
+    stand as written and nothing is rejected.
+    """
+    console.announce_step(
+        f"building items from {len(doc.relations)} relation(s)")
     items = build_items(doc)
+    console.announce_detail(
+        f"{console.format_count(len(items), 'item')} survived the "
+        f"distractor-safety rules")
     rejected = phrase_items(items, call_llm) if call_llm and items else []
     return items, rejected
 
@@ -380,19 +395,28 @@ def main(argv=None):
     if args.artifacts:
         config.ARTIFACTS_DIR = args.artifacts
     args.out = config.artifact_path(args.out)
+    print(f"generating MCQs from {args.input}")
     doc = Document.from_json(args.input)
+    console.announce_step(
+        f"{len(doc.relations)} relation(s), {len(doc.spans)} span(s) read")
     call = None
     if args.llm:
+        console.announce_step(
+            f"loading the {args.llm} backend for stem phrasing")
         from .llm_backends import get_backend
         call, _ = get_backend(args.llm)
+    else:
+        console.announce_step("no --llm: stems stay templated")
 
     items, rejected = generate(doc, call)
     if args.limit:
         items = items[:args.limit]
+        console.announce_step(f"keeping the first {args.limit} item(s)")
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(to_json(items))
 
     asserted = sum(1 for r in doc.relations if r.polarity == "affirmed")
+    print()
     print(f"{len(items)} items from {asserted} asserted relations "
           f"({len(eligible(doc))} of a questionable type)")
     if call:
@@ -401,7 +425,7 @@ def main(argv=None):
               f"({len(rejected)} rewrites rejected)")
         for r in rejected[:5]:
             print(f"  rejected {r['item_id']}: {r['reason']}")
-    print(f"-> {args.out}")
+    print(f"questions -> {args.out}")
 
 
 if __name__ == "__main__":

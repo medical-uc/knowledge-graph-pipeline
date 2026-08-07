@@ -32,10 +32,12 @@ import itertools
 import json
 import os
 import re
+import time
 from typing import Optional
 
 from .ir import Document, Span, Relation, Modifier
 from . import config
+from . import console
 from . import guards
 from . import ontology
 
@@ -67,7 +69,15 @@ def load_pipelines(models=None) -> list[tuple[str, object]]:
 
         MEDKG_NER_MODELS=en_ner_bc5cdr_md,en_ner_bionlp13cg_md
     """
-    return [(m, load_nlp(m)) for m in (models or config.NER_MODELS)]
+    names = list(models or config.NER_MODELS)
+    console.announce_step(
+        f"loading {console.format_count(len(names), 'scispaCy NER pipeline')} "
+        f"(abbreviations + negation)")
+    pipelines = []
+    for position, name in enumerate(names, start=1):
+        console.announce_detail(f"[{position}/{len(names)}] {name}")
+        pipelines.append((name, load_nlp(name)))
+    return pipelines
 
 
 def map_label(model: str, raw_label: str) -> str:
@@ -199,7 +209,12 @@ def extract_entities(doc: Document, nlp=None, pipelines=None) -> Document:
     if pipelines is None:
         pipelines = [("", nlp)] if nlp is not None else load_pipelines()
     counter = itertools.count(1)
-    for chunk in doc.extractable_chunks(config.EXTRACTABLE_CHUNK_KINDS):
+    chunks = doc.extractable_chunks(config.EXTRACTABLE_CHUNK_KINDS)
+    console.announce_step(
+        f"tagging entities in {console.format_count(len(chunks), 'chunk')} "
+        f"with {console.format_count(len(pipelines), 'model')}")
+    first_new_span = len(doc.spans)
+    for chunk in console.with_progress(chunks, "chunks tagged"):
         found = []
         for idx, (model, pipe) in enumerate(pipelines):
             for ent in pipe(chunk.text).ents:
@@ -217,6 +232,21 @@ def extract_entities(doc: Document, nlp=None, pipelines=None) -> Document:
                 negated=negated,
                 modifiers=[],                 # filled by extract_modifiers_llm
             ))
+    tagged = doc.spans[first_new_span:]
+    label_counts: dict[str, int] = {}
+    for span in tagged:
+        label_counts[span.label] = label_counts.get(span.label, 0) + 1
+    console.announce_detail(
+        f"{console.format_count(len(tagged), 'span')}, "
+        f"{sum(1 for s in tagged if s.negated)} negated")
+    if label_counts:
+        # The label mix is the single best predictor of relation yield: a
+        # relation can only fire if some model emitted both its endpoint
+        # labels, so a run that tagged nothing but Disease explains itself here
+        # rather than three stages later.
+        top = sorted(label_counts.items(), key=lambda kv: -kv[1])[:6]
+        console.announce_detail("labels: " + ", ".join(
+            f"{label} {count}" for label, count in top))
     return doc
 
 
@@ -429,27 +459,32 @@ def _call_anthropic(system: str, user: str, schema=None) -> str:
     return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
 
 
-def extract_relations(doc: Document, call_llm=_call_anthropic,
-                      progress=None) -> Document:
+def extract_relations(doc: Document, call_llm=_call_anthropic) -> Document:
     """One LLM call per chunk (treated as one sentence context here for brevity;
     split into sentences for long chunks). `call_llm` is injectable for testing."""
     counter = itertools.count(1)
     spans_by_id = {s.span_id: s for s in doc.spans}
     chunks = doc.extractable_chunks(config.EXTRACTABLE_CHUNK_KINDS)
-    for i, chunk in enumerate(chunks):
-        if progress:
-            progress("relations", f"{i + 1}/{len(chunks)}")
+    console.announce_step(
+        f"extracting relations from "
+        f"{console.format_count(len(chunks), 'chunk')} (one LLM call each)")
+    called, skipped, rejected = 0, 0, 0
+    already_extracted = len(doc.relations)
+    for chunk in console.with_progress(chunks, "chunks read"):
         spans = [s for s in doc.spans if s.chunk_id == chunk.chunk_id]
         if len(spans) < 1:
+            skipped += 1
             continue
         pairs = candidate_pairs(spans)
         involved = {s.span_id for pair in pairs for s in pair}
         subset = [s for s in spans if s.span_id in involved]
         if not subset:
+            skipped += 1
             continue
         prompt = build_re_prompt(chunk.text, subset, chunk.section_path,
                                  looks_structured(chunk.text))
         raw = call_llm(_SYSTEM, prompt, schema=RE_SCHEMA)
+        called += 1
         if not raw:
             doc.needs_review.append({"stage": "re-no-response",
                                      "chunk": chunk.chunk_id,
@@ -461,12 +496,33 @@ def extract_relations(doc: Document, call_llm=_call_anthropic,
                 rel.rel_id = f"r{next(counter):03d}"
                 doc.relations.append(rel)
             else:
+                rejected += 1
                 code, text = reason
                 doc.needs_review.append({"stage": "re", "code": code,
                                          "reason": text, "item": item,
                                          "chunk": chunk.chunk_id})
-    flag_direction_conflicts(doc)
-    guards.run_all(doc)
+    console.announce_detail(
+        f"{called} LLM call(s), {skipped} chunk(s) skipped for want of a "
+        f"candidate pair")
+    accepted = len(doc.relations) - already_extracted
+    console.announce_detail(
+        f"{console.format_count(accepted, 'relation')} accepted, "
+        f"{rejected} rejected by the grounding and ontology checks")
+
+    console.announce_step("checking relations against the deterministic guards")
+    conflicts = flag_direction_conflicts(doc)
+    before_guards = len(doc.relations)
+    report = guards.run_all(doc)
+    fired = {name: count for name, count in report.items()
+             if count and name not in ("affirmed_remaining", "degenerate_conf")}
+    console.announce_detail(
+        f"{before_guards} -> "
+        f"{console.format_count(len(doc.relations), 'relation')}, "
+        f"{report['affirmed_remaining']} still affirmed, "
+        f"{len(conflicts)} direction conflict(s)")
+    if fired:
+        console.announce_detail("guards fired: " + ", ".join(
+            f"{name} {count}" for name, count in sorted(fired.items())))
     return doc
 
 
@@ -547,21 +603,24 @@ def validate_modifier(item: dict, spans_by_id: dict[str, Span], text: str,
         char_start=text_offset + idx, char_end=text_offset + idx + len(mtext))
 
 
-def extract_modifiers_llm(doc: Document, call_llm=_call_anthropic,
-                          progress=None) -> Document:
+def extract_modifiers_llm(doc: Document, call_llm=_call_anthropic) -> Document:
     """One LLM call per chunk; attaches grounded modifiers to their spans. Handles
     titles/bullets (the section heading is injected) far better than a parser."""
     spans_by_id = {s.span_id: s for s in doc.spans}
     chunks = doc.extractable_chunks(config.EXTRACTABLE_CHUNK_KINDS)
-    for i, chunk in enumerate(chunks):
-        if progress:
-            progress("modifiers", f"{i + 1}/{len(chunks)}")
+    console.announce_step(
+        f"extracting modifiers from "
+        f"{console.format_count(len(chunks), 'chunk')} (one LLM call each)")
+    called, skipped, attached, rejected = 0, 0, 0, 0
+    for chunk in console.with_progress(chunks, "chunks read"):
         spans = [s for s in doc.spans if s.chunk_id == chunk.chunk_id]
         if not spans:
+            skipped += 1
             continue
         structured = looks_structured(chunk.text)
         prompt = build_modifier_prompt(chunk.text, spans, chunk.section_path, structured)
         raw = call_llm(_MOD_SYSTEM, prompt, schema=MODIFIER_SCHEMA)
+        called += 1
         if not raw:
             # The backend returned nothing (timeout, unparseable reply). Record
             # WHICH chunk, so this is re-runnable rather than an unexplained gap.
@@ -572,17 +631,38 @@ def extract_modifiers_llm(doc: Document, call_llm=_call_anthropic,
         for item in parse_llm_json(raw):
             res = validate_modifier(item, spans_by_id, chunk.text, chunk.char_start)
             if res is None:
+                rejected += 1
                 doc.needs_review.append({"stage": "modifier", "item": item, "chunk": chunk.chunk_id})
                 continue
             span_id, mod = res
             spans_by_id[span_id].modifiers.append(mod)
+            attached += 1
+    console.announce_detail(
+        f"{called} LLM call(s), {skipped} chunk(s) skipped for want of a span")
+    console.announce_detail(
+        f"{console.format_count(attached, 'modifier')} attached, "
+        f"{rejected} rejected as ungrounded or off-ontology")
     return doc
 
 
-def run(doc: Document, nlp=None, call_llm=_call_anthropic, progress=None) -> Document:
+def run(doc: Document, nlp=None, call_llm=_call_anthropic) -> Document:
+    """Stage 2's three passes over one document, in order: NER (with negation),
+    LLM modifiers, LLM relations. Returns the same Document, enriched in place.
+
+    `nlp` short-circuits pipeline loading with a single prepared spaCy pipeline
+    and `call_llm` injects the backend; both exist for testing. Progress is
+    reported on the console by each pass.
+    """
+    started_at = time.time()
+    console.announce_stage(2, "extract",
+                           "NER + LLM modifiers + LLM relations")
     doc = extract_entities(doc, nlp=nlp)                      # NER + negation
-    if progress:
-        progress("entities", len(doc.spans))
-    doc = extract_modifiers_llm(doc, call_llm=call_llm, progress=progress)
-    doc = extract_relations(doc, call_llm=call_llm, progress=progress)
+    doc = extract_modifiers_llm(doc, call_llm=call_llm)
+    doc = extract_relations(doc, call_llm=call_llm)
+    modifier_count = sum(len(span.modifiers) for span in doc.spans)
+    console.announce_finished(
+        "stage 2", started_at,
+        f"{console.format_count(len(doc.spans), 'span')}, "
+        f"{console.format_count(modifier_count, 'modifier')}, "
+        f"{console.format_count(len(doc.relations), 'relation')}")
     return doc

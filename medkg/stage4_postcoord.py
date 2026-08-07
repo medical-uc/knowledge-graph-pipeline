@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 
 from .ir import Document, Instance
 from . import config
+from . import console
 
 
 def det_id(*parts) -> str:
@@ -123,8 +125,30 @@ def instance_by_span(doc: Document) -> dict[str, str]:
 
 
 def postcoordinate(doc: Document) -> Document:
+    """Mint one instance node per modified, linked, affirmed span.
+
+    Returns the same Document with `instances` extended and any unresolvable
+    modifier value or misapplied deviation recorded in `needs_review`.
+    Idempotent: a span that already has an instance is skipped, so a resumed
+    corpus run does not build a second parallel set of nodes.
+    """
+    started_at = time.time()
+    console.announce_stage(4, "post-coordinate",
+                           "modified spans -> instance nodes")
+    # The ids are deterministic, so a second set of nodes would be invisible in
+    # the graph and would steadily inflate both the IR and the review queue.
+    already = {inst.source_span for inst in doc.instances}
+    candidates = [span for span in doc.spans
+                  if span.modifiers and span.uri and not span.negated]
+    console.announce_step(
+        f"{console.format_count(len(candidates), 'linked, affirmed span')} "
+        f"carry modifiers; {len(already)} already have an instance")
+    minted_before = len(doc.instances)
+    attribute_count, redirected = 0, 0
     for span in doc.spans:
         if not span.modifiers or not span.uri or span.negated:
+            continue
+        if span.span_id in already:
             continue
         inst_id = config.INST + det_id(doc.source.source_id, span.char_start, span.cui)
         attrs: list[tuple[str, str]] = []
@@ -147,4 +171,15 @@ def postcoordinate(doc: Document) -> Document:
         doc.instances.append(
             Instance(inst_id=inst_id, type_uri=span.uri, source_span=span.span_id,
                      attributes=attrs, label=compose_label(span)))
+        attribute_count += len(attrs)
+        if role_changing(span):
+            redirected += 1
+    minted = len(doc.instances) - minted_before
+    console.announce_detail(
+        f"{console.format_count(minted, 'instance')} minted, "
+        f"{console.format_count(attribute_count, 'attribute triple')}")
+    console.announce_detail(
+        f"{redirected} relation endpoint(s) redirected onto an instance "
+        f"by a role-changing modifier")
+    console.announce_finished("stage 4", started_at)
     return doc

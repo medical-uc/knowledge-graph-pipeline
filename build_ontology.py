@@ -54,7 +54,7 @@ import re
 import sys
 
 import medkg                                    # noqa: F401 -- thread pinning
-from medkg import config, ontology
+from medkg import config, console, ontology
 
 # ---------------------------------------------------------------------------
 # 1. Adoption: UMLS Semantic Network
@@ -288,10 +288,14 @@ def main(argv=None) -> int:
 
     if args.merge:
         base_path = args.into or ontology.DEFAULT_ONTOLOGY_PATH
+        print(f"merging {args.merge} into {base_path}")
         with open(base_path, encoding="utf-8") as fh:
             base = json.load(fh)
         with open(args.merge, encoding="utf-8") as fh:
             proposals = json.load(fh).get("relations", {})
+        console.announce_step(
+            f"{len(base.get('relations', {}))} existing type(s), "
+            f"{len(proposals)} proposed")
         merged, (added, skipped) = merge(base, proposals)
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(merged, fh, indent=2, ensure_ascii=False)
@@ -307,8 +311,11 @@ def main(argv=None) -> int:
         if not args.srstre2:
             sys.stderr.write("error: --from-srdef also needs --srstre2 for domains/ranges\n")
             return 2
+        print(f"reading the UMLS Semantic Network")
+        console.announce_step(f"definitions {args.from_srdef}")
         with open(args.from_srdef, encoding="utf-8", errors="replace") as fh:
             srdef = fh.read()
+        console.announce_step(f"domains and ranges {args.srstre2}")
         with open(args.srstre2, encoding="utf-8", errors="replace") as fh:
             srstre2 = fh.read()
         proposals.update(propose_from_umls(srdef, srstre2, config.ONTOLOGY))
@@ -317,9 +324,12 @@ def main(argv=None) -> int:
     if args.induce:
         from medkg.ir import Document
         from medkg import llm_backends
+        print(f"inducing types from {args.induce} with the {args.llm} backend")
         doc = Document.from_json(args.induce)
         call_llm = (llm_backends.get_backend(args.llm)[0] if args.llm != "claude"
                     else __import__("medkg.stage2_extract", fromlist=["x"])._call_anthropic)
+        console.announce_step(
+            f"one LLM call over {args.sample_size} sampled chunk(s)")
         induced = induce_from_corpus(doc, call_llm, args.sample_size)
         print(f"corpus induction: {len(induced)} candidate type(s)")
         for name, spec in induced.items():

@@ -6,14 +6,24 @@ triplestore (GraphDB / Stardog / Fuseki / Neptune), then issue the same SPARQL.
 """
 from __future__ import annotations
 
+import time
+
+from . import console
+
 
 def flatten(dataset):
     """Union all named graphs (incl. inferred) into one queryable Graph."""
+    console.announce_stage(8, "serve", "union the named graphs for querying")
+    contexts = list(dataset.contexts())
+    console.announce_step(
+        f"flattening {console.format_count(len(contexts), 'named graph')} "
+        f"into one queryable graph")
     from rdflib import Graph
     g = Graph()
-    for ctx in dataset.contexts():
+    for ctx in console.with_progress(contexts, "graphs merged"):
         for triple in ctx:
             g.add(triple)
+    console.announce_detail(console.format_count(len(g), "triple"))
     return g
 
 
@@ -57,22 +67,33 @@ def serialize(dataset, path: str, fmt: str = "nquads", verify: bool = True) -> d
     """
     from rdflib.term import Literal
 
+    started_at = time.time()
+    console.announce_stage(8, "serve", f"write and verify {path}")
+    console.announce_step("removing triples a literal subject makes unwritable")
     removed = 0
     for ctx in list(dataset.contexts()):
         for triple in [t for t in ctx if isinstance(t[0], Literal)]:
             ctx.remove(triple)
             removed += 1
+    console.announce_detail(f"{removed} removed")
 
+    console.announce_step(f"serializing as {fmt} -> {path}")
     dataset.serialize(destination=path, format=fmt)
 
     if verify:
         from rdflib import Dataset
+        console.announce_step("reading it back to prove the file parses")
         try:
-            Dataset().parse(path, format=fmt)
+            reloaded = Dataset()
+            reloaded.parse(path, format=fmt)
         except Exception as exc:              # noqa: BLE001
             raise ValueError(
                 f"{path} was written but cannot be read back ({exc}). "
                 "The graph contains something this syntax cannot express; "
                 "serializing it would leave you with an unusable artefact."
             ) from exc
+        console.announce_detail(
+            f"parsed back "
+            f"{console.format_count(sum(1 for _ in reloaded.quads()), 'quad')}")
+    console.announce_finished("stage 8", started_at)
     return {"removed_literal_subjects": removed}

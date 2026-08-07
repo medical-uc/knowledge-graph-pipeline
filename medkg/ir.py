@@ -90,6 +90,12 @@ class Chunk:
     without re-running Stage 1.
 
     Offsets index into `Document.normalized_path`, never the raw source.
+
+    `section_id` is the rewriter's own `<sec id="...">`, kept because it is the
+    unit Stage 6 names a graph after: everything extracted from one section is
+    asserted into `urn:graph:<source_id>/<section_id>`, which is what makes a
+    section retrievable as a subset. `section_path` stays the human-readable
+    heading trail; the id is what stays stable when a heading is reworded.
     """
     chunk_id: str
     text: str
@@ -98,6 +104,7 @@ class Chunk:
     section_path: list[str] = field(default_factory=list)
     kind: str = "prose"
     figure_refs: list[str] = field(default_factory=list)  # [[FIG:id]] anchors lifted out of prose
+    section_id: str = ""
 
 
 @dataclass
@@ -114,6 +121,7 @@ class Passage:
     char_start: int
     char_end: int
     section_path: list[str] = field(default_factory=list)
+    section_id: str = ""
 
 
 @dataclass
@@ -144,6 +152,7 @@ class Figure:
     caption_span: Optional[list[int]] = None
     description_span: Optional[list[int]] = None
     depicts: list[Depiction] = field(default_factory=list)   # Stage 5
+    section_id: str = ""                # the <sec> the figure block sits in
 
 
 @dataclass
@@ -178,6 +187,25 @@ class Document:
             if f.fig_id == fig_id:
                 return f
         return None
+
+    def sections(self) -> list[tuple[str, list[str]]]:
+        """(section_id, section_path) in document order, deduplicated.
+
+        The catalog Stage 6 writes is built from this, and `--list-scopes`
+        prints it: a section is only addressable if something in the document
+        actually landed in it.
+        """
+        out: list[tuple[str, list[str]]] = []
+        seen: set[str] = set()
+        for item in list(self.chunks) + list(self.passages):
+            if item.section_id and item.section_id not in seen:
+                seen.add(item.section_id)
+                out.append((item.section_id, list(item.section_path)))
+        return out
+
+    def chunk_section(self, chunk_id: str) -> str:
+        chunk = self.chunk_by_id(chunk_id)
+        return chunk.section_id if chunk is not None else ""
 
     def extractable_chunks(self, kinds=("prose",)) -> list[Chunk]:
         """Chunks Stage 2 may extract from. Every chunk is assertable text by

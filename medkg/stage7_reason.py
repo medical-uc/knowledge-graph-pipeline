@@ -12,7 +12,10 @@ scale.
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
+
+from . import console
 
 
 def is_literal(term) -> bool:
@@ -117,24 +120,48 @@ def materialize(dataset, ontology_ttl: Optional[str] = None,
     from rdflib import Graph
     from owlrl import DeductiveClosure, RDFS_Semantics
 
+    from . import config
+
+    started_at = time.time()
+    console.announce_stage(7, "reason", "RDFS/OWL-RL materialization")
+    # Provenance and the catalog describe the corpus; they are not claims about
+    # medicine. Feeding them to the closure derives nothing useful and puts
+    # graph URIs and section headings into the inferred graph, where a reader
+    # looking for what the reasoner concluded has to step over them.
+    skip = (config.GRAPH_PROVENANCE, config.GRAPH_CATALOG)
+    contexts = [ctx for ctx in dataset.contexts()
+                if str(ctx.identifier) not in skip]
+    console.announce_step(
+        f"collecting asserted triples from "
+        f"{console.format_count(len(contexts), 'named graph')} "
+        f"(provenance and catalog excluded)")
     base = Graph()
-    for ctx in dataset.contexts():
-        if str(ctx.identifier).endswith("provenance"):
-            continue
+    for ctx in console.with_progress(contexts, "graphs collected"):
         for triple in ctx:
             base.add(triple)
+    asserted_count = len(base)
     for triple in load_ontology_graph(ontology_ttl):
         base.add(triple)
+    console.announce_detail(
+        f"{console.format_count(asserted_count, 'asserted triple')} + "
+        f"{console.format_count(len(base) - asserted_count, 'schema axiom')}")
 
+    console.announce_step("expanding the deductive closure (RDFS semantics)")
     before = set(base)
     DeductiveClosure(RDFS_Semantics).expand(base)
     inferred, dropped = filter_materialized(set(base) - before, drop_axiomatic)
     if report is not None:
         report.update(dropped)
+    console.announce_detail(
+        f"{console.format_count(len(inferred), 'triple')} kept; dropped "
+        f"{dropped['literal_subject']} with a literal subject and "
+        f"{dropped['axiomatic']} vacuous rdfs:Resource")
 
     # Park inferred triples in their own named graph.
     from rdflib import URIRef
+    console.announce_step("parking the inferred triples in urn:graph:inferred")
     inf_graph = dataset.graph(URIRef("urn:graph:inferred"))
     for triple in inferred:
         inf_graph.add(triple)
+    console.announce_finished("stage 7", started_at)
     return inferred

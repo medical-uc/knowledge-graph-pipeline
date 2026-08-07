@@ -27,10 +27,12 @@ room for them. Nothing in this module auto-asserts a model-guessed finding.
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from .ir import Document, Depiction, Figure
 from . import config
+from . import console
 
 CAPTION_ONLY_DEPICTS = True
 
@@ -70,14 +72,23 @@ def bridge_figures(doc: Document, nlp=None, linker=None, rerank=None,
     """
     from .stage2_extract import load_pipelines
 
+    started_at = time.time()
+    console.announce_stage(5, "images",
+                           "figure captions -> depicts edges")
     if not doc.figures:
+        console.announce_step("no figures in this document; nothing to bridge")
         return doc
     pipelines = [("", nlp)] if nlp is not None else load_pipelines()
 
     only = CAPTION_ONLY_DEPICTS if caption_only is None else caption_only
-    for fig in doc.figures:
+    console.announce_step(
+        f"bridging {console.format_count(len(doc.figures), 'figure')} "
+        f"({'captions only' if only else 'captions and descriptions'})")
+    empty, depicted, unlinked = 0, 0, 0
+    for fig in console.with_progress(doc.figures, "figures bridged"):
         text = bridge_text(doc, fig, caption_only)
         if not text.strip():
+            empty += 1
             continue
         seen: set[str] = set()
         ents = [e for _, pipe in pipelines for e in pipe(text).ents]
@@ -94,11 +105,17 @@ def bridge_figures(doc: Document, nlp=None, linker=None, rerank=None,
             if linker is not None:
                 result = linker.link(mention, context=text, rerank=rerank)
                 if result is None:
+                    unlinked += 1
                     doc.needs_review.append({"stage": "stage5-link", "fig_id": fig.fig_id,
                                              "text": mention})
                     continue
                 dep.cui, dep.uri, dep.score = result
             fig.depicts.append(dep)
+            depicted += 1
+    console.announce_detail(
+        f"{console.format_count(depicted, 'concept')} depicted, "
+        f"{unlinked} mention(s) unlinked, {empty} figure(s) without text")
+    console.announce_finished("stage 5", started_at)
     return doc
 
 
@@ -110,14 +127,18 @@ def figure_uri(fig_id: str) -> str:
     return config.INST + "fig/" + fig_id
 
 
-def build_depicts_quads(doc: Document, graph: str) -> list[tuple]:
+def build_depicts_quads(doc: Document, graph: str, figures=None) -> list[tuple]:
     """(s, p, o, g) for every figure: the node, its caption/description literals,
     its source chunk, and one `ont:depicts` edge per linked concept. Pure stdlib
-    — mirrors `stage6_assert.build_quads`'s contract, `Lit` marks literals."""
+    — mirrors `stage6_assert.build_quads`'s contract, `Lit` marks literals.
+
+    `figures` narrows the set, so Stage 6 can call this once per section graph
+    rather than dumping every figure in the document into one of them.
+    """
     from .stage6_assert import Lit
 
     quads: list[tuple] = []
-    for fig in doc.figures:
+    for fig in (doc.figures if figures is None else figures):
         node = figure_uri(fig.fig_id)
         quads.append((node, config.RDF_TYPE, config.FIGURE_IMAGE, graph))
         if fig.image_path:

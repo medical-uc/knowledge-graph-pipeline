@@ -7,6 +7,15 @@
     python query.py graph.nq --sparql "SELECT ..."  # ad hoc
     python query.py graph.nq --file myquery.rq
 
+    python query.py graph.nq relations --doc thyroid_source
+    python query.py graph.nq concepts  --section "Hormone Synthesis"
+    python query.py graph.nq relations --group endocrine
+
+A scope (`--doc`, `--section`, `--group`) restricts the query to the named
+graphs that scope covers, which is the same selection `subset.py` writes out —
+use it to look before extracting, and to compare what one document says with
+what another does.
+
 The built-ins are generated from `medkg.config` rather than hardcoded, so they
 stay correct if the relation ontology changes. They are also written against
 the shapes Stage 6 actually emits, which is worth stating because two of them
@@ -53,23 +62,27 @@ def build_queries() -> dict[str, tuple[str, str]]:
     """name -> (description, sparql). Generated from the live ontology."""
     return {
         "relations": (
-            "Relations the SOURCE asserted, with labels and confidence. "
-            "Excludes anything flagged uncertain (see `flagged`) and anything "
-            "the reasoner derived (see `inferred`). An object rendered as "
-            "'iodine [deficiency]' is a post-coordinated instance node, not the "
-            "bare concept: the deviation is part of what the source claimed.",
+            "Relations the SOURCE asserted, with labels, confidence, and how "
+            "many extractions support each one. Excludes anything flagged "
+            "uncertain (see `flagged`) and anything the reasoner derived (see "
+            "`inferred`). An object rendered as 'iodine [deficiency]' is a "
+            "post-coordinated instance node, not the bare concept: the deviation "
+            "is part of what the source claimed.",
             PREFIXES + f"""
-SELECT ?subject ?predicate ?object ?confidence WHERE {{
+SELECT ?subject ?predicate ?object (MAX(?conf) AS ?confidence)
+       (COUNT(DISTINCT ?stmt) AS ?extractions) WHERE {{
   VALUES ?p {{ {_relation_values()} }}
   ?s ?p ?o .
   OPTIONAL {{ ?s rdfs:label ?sl }}
   OPTIONAL {{ ?o rdfs:label ?ol }}
   OPTIONAL {{ ?stmt rdf:subject ?s ; rdf:predicate ?p ; rdf:object ?o ;
-                    ont:confidence ?confidence }}
+                    ont:confidence ?conf }}
   BIND(COALESCE(?sl, STR(?s)) AS ?subject)
   BIND(COALESCE(?ol, STR(?o)) AS ?object)
   BIND(REPLACE(STR(?p), "^.*[#/]", "") AS ?predicate)
-}} ORDER BY ?subject ?predicate"""),
+}}
+GROUP BY ?subject ?predicate ?object
+ORDER BY ?subject ?predicate"""),
 
         "flagged": (
             "Relations demoted to uncertain by the Stage-2 guards -- reversed "
@@ -223,10 +236,12 @@ def load_graph(path: str, only=None, skip=(), keep_labels: bool = False):
     inferred graph can only print bare URIs.
     """
     from rdflib import Dataset, Graph
+    from medkg import console, corpus
+    console.write(f"loading {path} (N-Quads)")
     ds = Dataset()
     ds.parse(path, format="nquads")
     g = Graph()
-    for ctx in ds.contexts():
+    for ctx in corpus.graphs_of(ds):
         cid = str(ctx.identifier)
         selected = ((only is None or any(cid.endswith(x) for x in only))
                     and not any(cid.endswith(x) for x in skip))
@@ -234,6 +249,36 @@ def load_graph(path: str, only=None, skip=(), keep_labels: bool = False):
             if selected or (keep_labels and str(triple[1]) == config.RDFS_LABEL):
                 g.add(triple)
     return g
+
+
+def load_scoped(args, include_inferred: bool):
+    """Load only the named graphs a --doc/--section/--group scope covers.
+
+    Returns a flattened Graph, or None when there is nothing to query (the scope
+    matched nothing, or --scopes was asked for and printed). Uses the same
+    resolver `subset.py` does, so what a scoped query shows is exactly what an
+    extract of that scope would contain.
+    """
+    from medkg import corpus, stage8_serve
+
+    dataset = corpus.load_dataset(args.graph)
+    catalog = corpus.Catalog.from_dataset(dataset)
+    if args.scopes:
+        print(catalog.format())
+        return None
+
+    graphs, problems = corpus.resolve_scopes(
+        catalog, documents=args.docs, sections=args.sections, groups=args.groups,
+        all_graphs=corpus.graph_uris(dataset))
+    for problem in problems:
+        sys.stderr.write(f"error: {problem}\n")
+    if problems or not graphs:
+        sys.stderr.write("       `--scopes` prints what this graph has.\n")
+        return None
+
+    selected = corpus.select(dataset, graphs, include_inferred=include_inferred)
+    print("scope: " + ", ".join(graphs))
+    return stage8_serve.flatten(selected)
 
 
 def print_rows(rows, limit: int = 0) -> int:
@@ -273,6 +318,18 @@ def main(argv=None) -> int:
     ap.add_argument("--include-inferred", action="store_true",
                     help="include Stage 7's derived triples in every query "
                          "(default: only `inferred` and ad-hoc SPARQL see them)")
+    ap.add_argument("--doc", "--document", dest="docs", action="append", default=[],
+                    metavar="NAME",
+                    help="restrict to one document (source_id, graph URI, or part "
+                         "of its title). Repeatable.")
+    ap.add_argument("--section", dest="sections", action="append", default=[],
+                    metavar="NAME",
+                    help="restrict to one section (id, or part of its heading). "
+                         "With --doc, means that section of that document.")
+    ap.add_argument("--group", dest="groups", action="append", default=[],
+                    metavar="NAME", help="restrict to a declared document group")
+    ap.add_argument("--scopes", action="store_true",
+                    help="list the documents, sections and groups this graph has")
     args = ap.parse_args(argv)
 
     if args.list:
@@ -295,8 +352,31 @@ def main(argv=None) -> int:
     elif not (args.include_inferred or ad_hoc):
         load_kw = {"skip": (INFERRED_GRAPH,)}
 
+    scoped = bool(args.docs or args.sections or args.groups)
+    # Stage 7 reasons over the whole corpus and parks everything in ONE graph,
+    # so a derived triple has no section and may rest on a document the scope
+    # excludes. Scoping it would report a subset of the corpus's conclusions as
+    # if they were the scope's own, which is exactly the confusion the
+    # asserted/inferred split exists to prevent.
+    if scoped and name == "inferred":
+        sys.stderr.write(
+            "error: the inferred graph is corpus-wide -- it cannot be scoped to "
+            "a document or\n       section. To see what a scope alone entails, "
+            "re-reason over it:\n"
+            "         python subset.py {g} {scope} --reason --out scoped.nq\n"
+            "         python query.py scoped.nq inferred\n".format(
+                g=args.graph,
+                scope=" ".join(f"--doc {d}" for d in args.docs)
+                      + " ".join(f" --section {s}" for s in args.sections)
+                      + " ".join(f" --group {x}" for x in args.groups)))
+        return 2
     try:
-        graph = load_graph(args.graph, **load_kw)
+        if scoped or args.scopes:
+            graph = load_scoped(args, include_inferred=args.include_inferred)
+            if graph is None:
+                return 0 if args.scopes else 1
+        else:
+            graph = load_graph(args.graph, **load_kw)
     except FileNotFoundError:
         sys.stderr.write(f"error: no such graph file: {args.graph}\n")
         return 2
@@ -321,6 +401,7 @@ def main(argv=None) -> int:
 
     sparql = args.sparql
     if args.file:
+        print(f"# reading SPARQL from {args.file}\n")
         with open(args.file, encoding="utf-8") as fh:
             sparql = fh.read()
     if sparql is None:

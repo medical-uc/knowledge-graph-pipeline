@@ -36,6 +36,43 @@ To run the pipeline:
     --llm {claude|meditron|huatuo} \
     --ner en_ner_bc5cdr_md,en_ner_bionlp13cg_md
 
+To build ONE graph from every document in a directory:
+
+  python run.py --mode corpus \
+    --input inputs/ \
+    --index-dir umls_index/ \
+    --llm {claude|meditron|huatuo} \
+    --ner en_ner_bc5cdr_md,en_ner_bionlp13cg_md
+
+Each document is extracted into its own directory under `artifacts/docs/`, and
+the results are merged into a single `artifacts/graph.nq`. The run resumes: a
+document whose `ir.json` is already there and newer than its input is not
+extracted again, so an interrupted corpus run picks up where it stopped. Pass
+`--no-resume` to force the whole thing.
+
+To group documents, put a `corpus.json` next to the inputs (or point at one with
+`--groups`):
+
+  {"groups": {"endocrine": ["parathyroid_gland", "anatomy_of_endocrine_glands"]}}
+
+Members can be named by input filename or by `source_id` (which comes from the
+`<src>source:` line, and is NOT always the filename).
+
+To pull part of that graph back out — one section, one document, or a group:
+
+  python subset.py artifacts/graph.nq --list-scopes
+  python subset.py artifacts/graph.nq --doc parathyroid_gland --out thyroid.nq
+  python subset.py artifacts/graph.nq --doc parathyroid_gland \
+                                      --section "Hormone Synthesis"
+  python subset.py artifacts/graph.nq --group endocrine --out endocrine.nq
+
+A subset is a real graph: it carries the labels, provenance and catalog rows for
+what it contains, so it can be queried on its own with `query.py`. The same
+scopes work directly on a query, without writing a file first:
+
+  python query.py artifacts/graph.nq relations --doc parathyroid_gland
+  python query.py artifacts/graph.nq concepts --section "Thyroid Disorders"
+
 Here, `input_document.md` is a document that follows the format specified in
 
   https://github.com/medical-uc/document-rewriter
@@ -58,3 +95,14 @@ should give you a list of what you can do with the querying script.
 To generate the MCQ questions, run something like:
 
   python mcq.py artifacts/graph.ir.json --llm huatuo --out artifacts/questions.json
+
+MCQ generation reads one document's IR, so after a corpus run point it at a
+single document:
+
+  python mcq.py artifacts/docs/parathyroid_gland/ir.json --llm huatuo \
+    --out artifacts/parathyroid_questions.json
+
+It is deliberately per-document. Its distractor safety check asks whether the
+graph says anything at all about a candidate, and it answers that from the IR it
+was given — so a distractor it clears is clear with respect to THAT document, not
+the whole corpus.

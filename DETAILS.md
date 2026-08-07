@@ -492,10 +492,41 @@ urn:graph:thyroid_source dcterms:source "thyroid_source.md" ;
 `build_quads()` is pure Python and returns quads plus annotations, so triple
 generation is unit-testable; the rdflib adapter is a thin wrapper.
 
-**One named graph per source-version**, with provenance asserted once *on the
-graph* rather than stamped on every triple. Per-triple confidence uses RDF-star,
-serialized through a Turtle-star round trip, with an `rdf:Statement` reification
-fallback if the installed rdflib rejects it.
+**One named graph per (source-version, section)**, with provenance asserted once
+*on the document graph* rather than stamped on every triple. Per-triple
+confidence uses RDF-star, serialized through a Turtle-star round trip, with an
+`rdf:Statement` reification fallback if the installed rdflib rejects it — and the
+statement node's id includes its graph, so two documents that extracted the same
+fact do not share one node and attach two confidences to it.
+
+The section granularity is what makes a subset extractable, and it follows from
+the choice that was already made here: provenance lives on the graph, not the
+triple. Making the section a graph is therefore a change of grain, not of design.
+
+```
+urn:graph:thyroid_source        the document -- its provenance, and anything
+                                outside every <sec>
+urn:graph:thyroid_source/s3     one section of it
+urn:graph:labels                one label per concept, corpus-wide
+urn:graph:catalog               which documents, sections and groups exist
+urn:graph:provenance            what each document is, and what wrote its prose
+urn:graph:inferred              Stage 7
+```
+
+**Concept labels are corpus-level.** `rdfs:label` is functional in practice even
+though RDF does not enforce it: the `relations` query OPTIONAL-joins a label onto
+each endpoint, so a concept carrying a label from each of three documents returns
+every relation about it three times. One label per concept, in `urn:graph:labels`,
+chosen by frequency across the whole corpus.
+
+**A `source_id` collision is refused, not merged.** The id names the graph *and*
+seeds the Stage-4 instance hashes, so two documents sharing one would mint the
+same instance node for two different spans at the same offset, and the attributes
+of one would land on the other. It is a live risk rather than a theoretical one,
+because `source_id` comes from `<src>source:` — the original material — not from
+the input filename: two chapters rewritten from one textbook legitimately name
+the same origin. In this corpus, `parathyroid_gland.md` already asserts into
+`urn:graph:thyroid_source`.
 
 **Uncertain relations are reified, not asserted.** A guard-demoted relation
 becomes a `ClinicalAssertion` with `ont:polarity ont:Uncertain` — kept out of the
@@ -556,6 +587,53 @@ with a blank confidence sitting beside `myxedema complication_of hypothyroidism`
 at 0.9. That reads as a duplicated extraction and is in fact the subPropertyOf
 axiom working correctly — the query was unioning every graph and discarding the
 distinction Stage 7 exists to maintain.
+
+---
+
+## 11b. Corpora, and subsets of them
+
+`run.py --mode corpus` builds one graph from many documents. Stages 1–5 run per
+document into `artifacts/docs/<stem>/`; Stage 6 sees all of them at once, Stage 7
+reasons over the union, Stage 8 writes one `.nq`.
+
+**Documents merge at the RDF layer, not the IR layer.** Concatenating IRs first
+looks simpler and is not: chunk offsets index into a per-document normalized
+file, and chunk and span ids are only unique within a document, so a merged IR
+would have to renumber both — and renumbering breaks the offset contract every
+grounding check depends on. Merging at the graph layer needs neither, because the
+documents were already destined for different named graphs. It also means Stage 6
+is the first stage that has to know a corpus exists.
+
+**A corpus run resumes.** Stage 2 is an LLM call per chunk and Stage 3 loads
+FAISS and SapBERT; over four documents that is hundreds of calls, and a failure
+at the fourth used to be indistinguishable from a failure at the first. A
+document whose IR is already on disk and newer than its input is not re-extracted.
+This is the same reasoning as the single-document Stage-2 checkpoint, one level up.
+
+**Extraction is set selection, not a query.** A section is a graph, a document is
+its graph plus its sections', a group is the union over its members. `subset.py`
+copies those contexts into a new dataset. Nothing decides what "belongs" to a
+section by reachability — the subset is exactly what was asserted there, which is
+the only answer that stays true as the graph grows.
+
+Three things always come with a subset, each because leaving it out makes the
+output worse than useless rather than merely smaller: **labels**, or every row is
+a bare SNOMED URI; **provenance** for the documents included, because an extract
+of a traceable graph that cannot say where its claims came from is not a smaller
+version of that graph but a less honest one; and the **catalog** rows for what
+was selected, so the file can state what it is a subset of.
+
+**Inferred triples do not come along by default.** Stage 7 reasoned over the
+whole corpus, so a derivation inside a scope may rest on a document outside it.
+`--include-inferred` carries them as they stand; `--reason` re-derives them from
+the subset alone, which is the answer that is actually true of it. For the same
+reason `query.py` refuses `inferred` together with a scope rather than answering
+a question it cannot answer honestly.
+
+**Groups are declared, never inferred.** Two documents sharing a word in their
+titles is not evidence that a reader wants them queried together, and a guessed
+grouping would be indistinguishable in the graph from one a curator meant. They
+live in a `corpus.json` manifest beside the inputs.
 
 ---
 
@@ -667,7 +745,12 @@ as Stage 2's grounding rule.
 ## 16. Where output goes
 
 Everything the pipeline writes — normalized text, stage checkpoints, the
-N-Quads, the IR, generated questions — goes to an artifacts directory.
+N-Quads, the IR, generated questions — goes to an artifacts directory. A corpus
+run gives each document its own subdirectory, `artifacts/docs/<stem>/`, and
+writes only the merged graph at the top. Sharing one set of filenames across
+documents would have the second document's checkpoint overwrite the first's,
+which is noticed at the end of the run, when the graph is short and everything
+that could diagnose it is gone.
 
 The path contract: a **bare filename** is a name and gets redirected, so
 `--out graph.nq` writes into artifacts. Anything with a **directory component**

@@ -9,7 +9,7 @@ afterwards is too late.
 from . import native_env as native_env  # noqa: F401  -- must be first
 
 __all__ = [
-    "ir", "config", "native_env",
+    "ir", "config", "console", "native_env",
     "stage1_parse", "stage2_extract", "stage3_link", "stage4_postcoord",
     "stage5_images", "stage6_assert", "stage7_reason", "stage8_serve",
 ]

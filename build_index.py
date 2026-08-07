@@ -19,6 +19,7 @@ import argparse
 import time
 
 from medkg import config
+from medkg import console
 from medkg.stage3_link import build_index, SapBertLinker
 
 DEFAULT_PROBES = ["myocardial infarction", "heart attack", "aspirin", "chest pain"]
@@ -38,18 +39,22 @@ def sanity_check(out_dir, model, probes):
     --max-atoms subset the 'right' concept is usually absent — that's expected;
     the point is to prove embed -> FAISS search -> cui map -> uri all round-trip.
     """
-    print("\n[sanity] loading linker and probing known mentions...")
+    print()
+    print(f"sanity check: round-tripping {len(probes)} known mention(s) "
+          f"through the index just built")
     linker = SapBertLinker(out_dir, model_name=model)
-    for m in probes:
+    for position, m in enumerate(probes, start=1):
         cands = linker.candidates(m, k=3)
         best = linker.link(m, context=m)
         names = getattr(linker, "names", {})
         top = ", ".join(f"{cui}({names.get(cui, '?')}):{s:.2f}" for cui, s in cands) or "(none)"
-        print(f"  {m!r:34} -> {top}")
+        console.announce_step(f"[{position}/{len(probes)}] {m!r} -> {top}")
         if best:
-            print(f"       linked: {best[0]}  {best[1]}  score={best[2]:.2f}")
+            console.announce_detail(
+                f"linked: {best[0]}  {best[1]}  score={best[2]:.2f}")
         else:
-            print(f"       below floor / not in subset (expected on --max-atoms)")
+            console.announce_detail(
+                "below floor / not in subset (expected on --max-atoms)")
 
 
 def main():
@@ -72,14 +77,19 @@ def main():
     embed_sabs = parse_sabs(args.sabs)
     keep_sabs = parse_sabs(args.keep_sabs) or {"SNOMEDCT_US", "RXNORM"}
 
-    print(f"[build] mrconso={args.mrconso}")
-    print(f"[build] embed SABs={embed_sabs or 'ALL English'} | crosswalk SABs={sorted(keep_sabs)}"
-          f"{f' | max_atoms={args.max_atoms}' if args.max_atoms else ''}")
+    print("building the SapBERT/FAISS UMLS index")
+    console.announce_step(f"mrconso    {args.mrconso}")
+    console.announce_step(f"out-dir    {args.out_dir}")
+    console.announce_step(f"embed      {embed_sabs or 'ALL English'}"
+                          + (f" (capped at {args.max_atoms:,} atoms)"
+                             if args.max_atoms else ""))
+    console.announce_step(f"crosswalk  {sorted(keep_sabs)}")
+    console.announce_step(f"model      {args.model}")
     t0 = time.time()
     build_index(args.mrconso, args.out_dir, model_name=args.model,
                 keep_sabs=tuple(keep_sabs), embed_sabs=embed_sabs,
                 max_atoms=args.max_atoms, batch=args.batch, progress=not args.no_progress)
-    print(f"[build] done in {time.time() - t0:.1f}s")
+    print(f"index built in {console.format_duration(time.time() - t0)}")
 
     if not args.no_sanity:
         sanity_check(args.out_dir, args.model, args.probe or DEFAULT_PROBES)

@@ -39,7 +39,6 @@ anthropic>=0.40
 torch>=2.1
 transformers>=4.40
 faiss-cpu>=1.8          # on macOS prefer `conda install -c pytorch faiss-cpu` (see README segfault note)
-tqdm>=4.66              # optional: progress bar for build_index.py (degrades gracefully if absent)
 
 # --- Optional: self-hosted Meditron backend (Stage 2 / Stage 3 rerank) ---
 openai>=1.30            # talks to your vLLM OpenAI-compatible endpoint
