@@ -60,6 +60,10 @@ def configure_native_threads(faiss=None, torch=None, threads: int = None) -> int
 
 # MRCONSO.RRF column order (0-indexed) per UMLS spec.
 _CUI, _LAT, _SAB, _CODE, _STR, _SUPPRESS = 0, 1, 11, 13, 14, 16
+# MRSTY.RRF is CUI|TUI|STN|STY|ATUI|CVF.
+_STY_CUI, _STY_TUI = 0, 1
+
+SEMANTIC_TYPES_FILE = "semantic_types.json"
 
 
 def parse_mrconso(path: str, langs=("ENG",)) -> Iterator[tuple[str, str, str, str]]:
@@ -78,6 +82,82 @@ def parse_mrconso(path: str, langs=("ENG",)) -> Iterator[tuple[str, str, str, st
             if cols[_SUPPRESS] in {"O", "E", "Y"}:  # suppressed atoms
                 continue
             yield cols[_CUI], cols[_SAB], cols[_CODE], cols[_STR]
+
+
+def parse_mrsty(path: str) -> Iterator[tuple[str, str]]:
+    """Yield (cui, tui) from MRSTY.RRF. Pure stdlib.
+
+    A CUI carries one row per semantic type, so a concept that is both a peptide
+    and a hormone yields twice.
+    """
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            cols = line.rstrip("\n").split("|")
+            if len(cols) <= _STY_TUI:
+                continue
+            cui, tui = cols[_STY_CUI], cols[_STY_TUI]
+            if cui and tui:
+                yield cui, tui
+
+
+def collect_semantic_types(rows, restrict_to=None) -> dict[str, list[str]]:
+    """(cui, tui) rows -> {cui: [tui, ...]}, optionally restricted to a CUI set.
+
+    Pure, stdlib-only, and the unit under test. `restrict_to` is what keeps the
+    sidecar proportional to the index rather than to all of UMLS: the linker can
+    only ever return a CUI it has embedded, so semantic types for the rest are
+    dead weight.
+    """
+    out: dict[str, list[str]] = {}
+    for rows_read, (cui, tui) in enumerate(rows, start=1):
+        if not rows_read % 1_000_000:
+            console.announce_detail(
+                f"{rows_read // 1_000_000}M semantic-type rows read, "
+                f"{len(out):,} concept(s) kept")
+        if restrict_to is not None and cui not in restrict_to:
+            continue
+        bucket = out.setdefault(cui, [])
+        if tui not in bucket:
+            bucket.append(tui)
+    return out
+
+
+def build_semantic_types(mrsty_path: str, out_dir: str,
+                         restrict_to=None) -> dict[str, list[str]]:
+    """Write `semantic_types.json` into an existing index directory.
+
+    Deliberately separable from `build_index`: the sidecar is a few minutes of
+    text parsing while the embedding pass is hours, so an index built before
+    semantic types existed can gain them without re-embedding a single atom.
+    `restrict_to` is a set of CUIs to keep; None keeps every CUI in MRSTY.
+
+    Returns the mapping it wrote.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    console.announce_step(f"reading semantic types from {mrsty_path}")
+    mapping = collect_semantic_types(parse_mrsty(mrsty_path), restrict_to)
+    path = os.path.join(out_dir, SEMANTIC_TYPES_FILE)
+    with open(path, "w") as fh:
+        json.dump(mapping, fh)
+    console.announce_detail(
+        f"{len(mapping):,} concept(s) with a semantic type -> {path}")
+    return mapping
+
+
+def indexed_cuis(index_dir: str) -> Optional[set]:
+    """Every CUI the index can return, or None if the index is not readable.
+
+    Used to size the semantic-type sidecar to the index it sits beside.
+    """
+    cuis_path = os.path.join(index_dir, "cuis.npy")
+    if not os.path.exists(cuis_path):
+        return None
+    keep = {str(c) for c in np.load(cuis_path)}
+    codes_path = os.path.join(index_dir, "codes.json")
+    if os.path.exists(codes_path):
+        with open(codes_path) as fh:
+            keep |= set(json.load(fh))
+    return keep
 
 
 def cui_to_uri(cui: str, codes: dict[str, dict[str, str]]) -> str:
@@ -149,8 +229,8 @@ def build_index(mrconso_path: str, out_dir: str,
                 model_name: str = config.SAPBERT_MODEL,
                 keep_sabs=("SNOMEDCT_US", "RXNORM"), embed_sabs=None,
                 max_atoms: Optional[int] = None, batch: int = 256,
-                progress: bool = True) -> None:
-    """Embed MRCONSO's atoms and write the four files `SapBertLinker` reads.
+                progress: bool = True, mrsty_path: str = "") -> None:
+    """Embed MRCONSO's atoms and write the files `SapBertLinker` reads.
 
     `mrconso_path` is the UMLS MRCONSO.RRF; `out_dir` receives umls.faiss,
     cuis.npy, codes.json and names.json, and is created if missing. `keep_sabs`
@@ -158,7 +238,9 @@ def build_index(mrconso_path: str, out_dir: str,
     (None for every English atom) the ones whose surface forms are embedded,
     and `max_atoms` caps the embedded count for a smoke test. `batch` is the
     embedding batch size, and `progress` toggles the step-by-step commentary
-    (the closing summary is printed either way).
+    (the closing summary is printed either way). `mrsty_path` additionally
+    writes `semantic_types.json`, which is what lets Stage 3 correct span labels
+    -- an index without it still links, it just leaves the NER labels alone.
 
     Raises ValueError if the filters selected no atoms at all. Runs for hours
     on a full release, so it is deliberately noisy.
@@ -209,8 +291,12 @@ def build_index(mrconso_path: str, out_dir: str,
             json.dump(codes, fh)
         with open(os.path.join(out_dir, "names.json"), "w") as fh:
             json.dump(names, fh)
-        console.announce_detail(
-            "umls.faiss, cuis.npy, codes.json, names.json")
+        written = "umls.faiss, cuis.npy, codes.json, names.json"
+        if mrsty_path:
+            build_semantic_types(mrsty_path, out_dir,
+                                 restrict_to=set(cuis) | set(codes))
+            written += f", {SEMANTIC_TYPES_FILE}"
+        console.announce_detail(written)
     finally:
         console.set_quiet(was_quiet)
     console.announce_step(
@@ -247,14 +333,42 @@ class SapBertLinker:
             self.codes = json.load(fh)
         names_path = os.path.join(index_dir, "names.json")
         self.names = json.load(open(names_path)) if os.path.exists(names_path) else {}
+        sty_path = os.path.join(index_dir, SEMANTIC_TYPES_FILE)
+        self.semantic_types = (json.load(open(sty_path))
+                               if os.path.exists(sty_path) else {})
         console.announce_detail(
             f"{len(self.cuis):,} embedded atom(s), "
             f"{len(self.codes):,} concept(s) with a crosswalk code")
+        if self.semantic_types:
+            console.announce_detail(
+                f"{len(self.semantic_types):,} concept(s) with a semantic type")
+        else:
+            console.announce_detail(
+                f"no {SEMANTIC_TYPES_FILE} beside the index: span labels will "
+                f"stay as the NER models emitted them (see --mrsty)")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         console.announce_step(
             f"loading SapBERT ({model_name}) on {self.device}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name).to(self.device).eval()
+
+    def label_for(self, cui: str) -> str:
+        """The ontology span label this concept's semantic types imply, or ''.
+
+        A CUI usually carries several: insulin is a peptide, a hormone and a
+        pharmacologic substance at once. `config.SEMANTIC_TYPE_PRIORITY` decides
+        between them, most specific first, because the label hierarchy only
+        weakens upward — a `Protein` satisfies a `Substance` constraint and not
+        the reverse, so the specific answer is the one that keeps the most
+        relation types reachable.
+        """
+        labels = {config.SEMANTIC_TYPE_LABELS[tui]
+                  for tui in self.semantic_types.get(cui, ())
+                  if tui in config.SEMANTIC_TYPE_LABELS}
+        for label in config.SEMANTIC_TYPE_PRIORITY:
+            if label in labels:
+                return label
+        return ""
 
     def candidates(self, mention: str, k: int = 20) -> list[tuple[str, float]]:
         vec = _embed(self.model, self.tokenizer, [mention], self.device)
@@ -305,6 +419,49 @@ class SapBertLinker:
         return cui, cui_to_uri(cui, self.codes), score
 
 
+def link_modifier_values(span, linker: SapBertLinker,
+                         cache: dict = None) -> None:
+    """Link this span's modifier VALUES, so "severe" becomes a concept node.
+
+    Mentions are resolved without chunk context on purpose: a modifier value is
+    a word like "severe", and the surrounding sentence disambiguates the entity
+    it qualifies rather than the qualifier. Role-changing values (deviations)
+    are resolved from the ontology's lexicon in Stage 4 and ignore whatever
+    lands here — see `stage4_postcoord._value_uri`.
+    """
+    if cache is None:
+        cache = {}
+    for mod in span.modifiers:
+        key = (mod.text.lower(), None)
+        if key not in cache:
+            cache[key] = linker.link(mod.text)
+        result = cache[key]
+        if result is not None:
+            mod.cui, mod.uri, _ = result
+
+
+def link_modifiers(doc: Document, linker: SapBertLinker) -> Document:
+    """Link every modifier value in the document.
+
+    Its own pass because Stage 2's modifier extraction now runs AFTER Stage 3:
+    the spans have to be linked before the relation prompt sees their labels, so
+    by the time the modifiers exist `link_document` has already been and gone.
+    """
+    cache: dict[tuple, Optional[tuple]] = {}
+    modified = [s for s in doc.spans if s.modifiers]
+    if not modified:
+        return doc
+    console.announce_step(
+        f"linking the modifier values on "
+        f"{console.format_count(len(modified), 'span')}")
+    for span in modified:
+        link_modifier_values(span, linker, cache)
+    resolved = sum(1 for s in modified for m in s.modifiers if m.uri)
+    total = sum(len(s.modifiers) for s in modified)
+    console.announce_detail(f"{resolved}/{total} modifier value(s) linked")
+    return doc
+
+
 def link_document(doc: Document, linker: SapBertLinker, rerank=None) -> Document:
     """Link every span. Identical mentions are resolved once and reused: a
     textbook chapter repeats "thyroid" and "T3" dozens of times, and both the
@@ -334,14 +491,7 @@ def link_document(doc: Document, linker: SapBertLinker, rerank=None) -> Document
             doc.needs_review.append({"stage": "link", "span_id": span.span_id, "text": span.text})
             continue
         span.cui, span.uri, span.link_score = result
-        # Also try to link modifier VALUES so "severe" becomes a concept node.
-        for m in span.modifiers:
-            mkey = (m.text.lower(), None)
-            if mkey not in cache:
-                cache[mkey] = linker.link(m.text)
-            r = cache[mkey]
-            if r is not None:
-                m.cui, m.uri, _ = r
+        link_modifier_values(span, linker, cache)
     linked = sum(1 for span in doc.spans if span.uri)
     console.announce_detail(
         f"{linked}/{len(doc.spans)} linked, {unlinked} below the "
@@ -349,4 +499,57 @@ def link_document(doc: Document, linker: SapBertLinker, rerank=None) -> Document
     console.announce_detail(
         f"{reused} mention(s) answered from cache, "
         f"{console.format_count(len(cache), 'distinct mention')} resolved")
+    return doc
+
+
+def reconcile_labels(doc: Document, linker: SapBertLinker) -> Document:
+    """Re-derive every linked span's ontology label from its UMLS semantic type.
+
+    The NER label decides which relation types a span can take part in, and in a
+    corpus outside the models' training domain it is the pipeline's dominant
+    failure. `en_ner_bionlp13cg_md` was trained on cancer genetics, so on an
+    anatomy corpus it reads `abdominal cavity`, `pelvic floor` and `bloodstream`
+    as PATHOLOGICAL_FORMATION and `thyroid gland` as CANCER; `en_ner_bc5cdr_md`
+    calls every gland a DISEASE. In a ten-document run that produced 1,414 of
+    1,965 validator rejections — 72% — concentrated on `part_of`, `located_in`
+    and `composed_of`, which is what the corpus is made of. A surface-form
+    override list does not fix it: those rejections spread over 482 distinct
+    (surface, label) pairs.
+
+    The linked concept is the better authority and it is already being
+    computed. NER keeps the job it is good at, finding where the mentions are;
+    the type comes from the concept the mention resolved to.
+
+    Nothing is discarded: the original goes to `Span.ner_label`, so the override
+    stays inspectable in the IR. A span whose concept has no mapped semantic
+    type keeps the NER label. No-op, with a warning, when the index has no
+    semantic-type sidecar.
+    """
+    if not linker.semantic_types:
+        console.announce_step(
+            "skipping label reconciliation: the index has no semantic types")
+        return doc
+    console.announce_step(
+        "reconciling span labels against their linked concept's semantic type")
+    changed, kept, unmapped = 0, 0, 0
+    moves: dict[tuple, int] = {}
+    for span in doc.spans:
+        if not span.cui:
+            continue
+        label = linker.label_for(span.cui)
+        if not label:
+            unmapped += 1
+            continue
+        if label == span.label:
+            kept += 1
+            continue
+        span.ner_label = span.ner_label or span.label
+        moves[(span.label, label)] = moves.get((span.label, label), 0) + 1
+        span.label = label
+        changed += 1
+    console.announce_detail(
+        f"{changed} span label(s) rewritten, {kept} confirmed, "
+        f"{unmapped} left as tagged (no mapped semantic type)")
+    for (was, now), count in sorted(moves.items(), key=lambda kv: -kv[1])[:6]:
+        console.announce_detail(f"  {was} -> {now}: {count}")
     return doc

@@ -84,7 +84,22 @@ def normalize(data: dict, path: str = "<memory>") -> dict:
                  for name, spec in (data.get("modifiers") or {}).items()}
     modifier_meta = {name: spec for name, spec in (data.get("modifiers") or {}).items()}
     values = {k: expand(v) for k, v in (data.get("modifier_values") or {}).items()}
+    # Value pairs that cannot both hold of one mention. Only genuine opposites
+    # belong here: insulin deficiency and insulin resistance are two facts about
+    # one hormone, and treating "two different values" as a contradiction would
+    # discard both.
+    antonyms = frozenset(
+        frozenset(expand(v) for v in pair)
+        for pair in (data.get("modifier_value_antonyms") or ())
+        if len(pair) == 2)
     ner_models = {m: dict(labels) for m, labels in (data.get("ner_models") or {}).items()}
+    semantic_types = {
+        str(tui): str(label)
+        for tui, label in (data.get("semantic_types") or {}).items()}
+    # Most specific label first. The label hierarchy weakens upward only, so
+    # when a concept carries several semantic types the specific answer keeps
+    # the most relation types reachable.
+    priority = tuple(data.get("semantic_type_priority") or ())
     return {
         "version": data.get("version", "unversioned"),
         "path": path,
@@ -92,17 +107,31 @@ def normalize(data: dict, path: str = "<memory>") -> dict:
         "modifiers": modifiers,
         "modifier_meta": modifier_meta,
         "modifier_values": values,
+        "modifier_value_antonyms": antonyms,
         "ner_models": ner_models,
         "label_hierarchy": label_parents,
+        "semantic_types": semantic_types,
+        "semantic_type_priority": priority,
     }
 
 
-def emitted_labels(onto: dict, models=None) -> set[str]:
-    """Span labels the configured NER models can actually produce."""
+def emitted_labels(onto: dict, models=None,
+                   semantic_types: bool = True) -> set[str]:
+    """Span labels a run can actually produce.
+
+    Two sources. NER emits the label a span starts with; Stage 3 then re-derives
+    it from the linked concept's UMLS semantic type, which reaches labels no
+    model in `ner_models` emits — `Finding` and `Symptom` are only reachable
+    that way, and `has_function` was reported dead for exactly that reason.
+    Pass `semantic_types=False` to ask what NER alone can reach, which is what a
+    run against an index with no `semantic_types.json` gets.
+    """
     models = list(onto["ner_models"]) if models is None else list(models)
     out: set[str] = set()
     for m in models:
         out |= set(onto["ner_models"].get(m, {}).values())
+    if semantic_types:
+        out |= set(onto.get("semantic_types", {}).values())
     return out
 
 
@@ -205,14 +234,16 @@ def validate_hierarchy(onto: dict) -> list[dict]:
     return problems
 
 
-def validate(onto: dict, models=None) -> list[dict]:
+def validate(onto: dict, models=None,
+             semantic_types: bool = True) -> list[dict]:
     """Report relation types that cannot fire with the configured NER models.
 
     Returns one entry per unusable type. An empty list means every relation in
     the ontology has at least one reachable head label and (unless unary) at
-    least one reachable tail label.
+    least one reachable tail label. `semantic_types` says whether Stage 3's
+    label reconciliation is counted as a source of labels; see `emitted_labels`.
     """
-    available = emitted_labels(onto, models)
+    available = emitted_labels(onto, models, semantic_types)
     problems: list[dict] = []
     problems += validate_hierarchy(onto)
     problems += validate_labels(onto)
@@ -238,26 +269,32 @@ def validate(onto: dict, models=None) -> list[dict]:
     return problems
 
 
-def summary(onto: dict, models=None, default_models: bool = False) -> str:
+def summary(onto: dict, models=None, default_models: bool = False,
+            semantic_types: bool = True) -> str:
     """Reachability report. `models` MUST be the same list the run will use.
 
-    Reachability is entirely a function of the NER models: with bc5cdr alone
-    only Disease and Drug exist, so 10 relation types are dead; add bionlp13cg
-    and 9 labels exist and only `has_function` is. The report therefore names
-    the models it checked, because a report that silently described a different
-    configuration than the warning that sent you to it is worse than no report.
+    Reachability used to be entirely a function of the NER models: with bc5cdr
+    alone only Disease and Drug exist, so 10 relation types are dead. Stage 3's
+    label reconciliation is the second source, and it reaches labels no model
+    emits, so the report names both and says which it counted. A report that
+    silently described a different configuration than the warning that sent you
+    to it is worse than no report.
     """
-    problems = validate(onto, models)
+    problems = validate(onto, models, semantic_types)
     usable = len(onto["relations"]) - len(problems)
     shown = list(models) if models is not None else list(onto["ner_models"])
+    from_ner = sorted(emitted_labels(onto, models, semantic_types=False))
+    available = sorted(emitted_labels(onto, models, semantic_types))
     lines = [f"ontology {onto['version']} ({onto['path']})",
              f"  NER models checked: {', '.join(shown) or '(none)'}"
              + ("   <- DEFAULT; pass --ner to check the models you actually run"
                 if default_models else ""),
-             f"  relations: {len(onto['relations'])} ({usable} usable with these "
-             f"models)",
+             f"  relations: {len(onto['relations'])} ({usable} usable)",
              f"  modifiers: {len(onto['modifiers'])}",
-             f"  span labels available: {', '.join(sorted(emitted_labels(onto, models))) or '(none)'}"]
+             f"  span labels from NER: {', '.join(from_ner) or '(none)'}",
+             f"  span labels available: {', '.join(available) or '(none)'}"
+             + ("   (NER + Stage-3 semantic types)" if semantic_types
+                else "   (NER only: the index has no semantic_types.json)")]
     for p in problems:
         lines.append(f"  UNUSABLE {p['relation']}: {p['reason']} "
                      f"(head={p['head']} tail={p['tail']})")

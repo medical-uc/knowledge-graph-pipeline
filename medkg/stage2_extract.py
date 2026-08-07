@@ -645,24 +645,48 @@ def extract_modifiers_llm(doc: Document, call_llm=_call_anthropic) -> Document:
     return doc
 
 
-def run(doc: Document, nlp=None, call_llm=_call_anthropic) -> Document:
-    """Stage 2's three passes over one document, in order: NER (with negation),
-    LLM modifiers, LLM relations. Returns the same Document, enriched in place.
+def run_ner(doc: Document, nlp=None) -> Document:
+    """Stage 2's first pass: NER with negation. No LLM, no network.
 
-    `nlp` short-circuits pipeline loading with a single prepared spaCy pipeline
-    and `call_llm` injects the backend; both exist for testing. Progress is
-    reported on the console by each pass.
+    Split from the LLM passes because Stage 3 belongs between them. A span's
+    label decides which relation types it can take part in, and the label is
+    only trustworthy once the mention has been linked -- see
+    `stage3_link.reconcile_labels`. Running the whole of Stage 2 first meant the
+    relation prompt, the candidate pairing and the validator all worked from
+    labels an out-of-domain NER model had guessed.
     """
     started_at = time.time()
-    console.announce_stage(2, "extract",
-                           "NER + LLM modifiers + LLM relations")
-    doc = extract_entities(doc, nlp=nlp)                      # NER + negation
+    console.announce_stage(2, "extract", "NER (spans for Stage 3 to link)")
+    doc = extract_entities(doc, nlp=nlp)
+    console.announce_finished(
+        "stage 2 (NER)", started_at,
+        f"{console.format_count(len(doc.spans), 'span')}")
+    return doc
+
+
+def run_llm(doc: Document, call_llm=_call_anthropic) -> Document:
+    """Stage 2's LLM passes over already-linked spans: modifiers, then relations
+    (which ends by running the deterministic guards)."""
+    started_at = time.time()
+    console.announce_stage(2, "extract", "LLM modifiers + LLM relations")
     doc = extract_modifiers_llm(doc, call_llm=call_llm)
     doc = extract_relations(doc, call_llm=call_llm)
     modifier_count = sum(len(span.modifiers) for span in doc.spans)
     console.announce_finished(
-        "stage 2", started_at,
+        "stage 2 (LLM)", started_at,
         f"{console.format_count(len(doc.spans), 'span')}, "
         f"{console.format_count(modifier_count, 'modifier')}, "
         f"{console.format_count(len(doc.relations), 'relation')}")
     return doc
+
+
+def run(doc: Document, nlp=None, call_llm=_call_anthropic) -> Document:
+    """Stage 2 end to end, with no linking in between.
+
+    `nlp` short-circuits pipeline loading with a single prepared spaCy pipeline
+    and `call_llm` injects the backend; both exist for testing. This is what
+    `--mode stage2` runs, and the labels it extracts against are the raw NER
+    ones -- a full or corpus run interleaves Stage 3 instead.
+    """
+    doc = run_ner(doc, nlp=nlp)
+    return run_llm(doc, call_llm=call_llm)

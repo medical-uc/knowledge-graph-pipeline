@@ -29,15 +29,23 @@ reasoner derived, and what the pipeline could not verify.
 ```
 tagged markdown
   → Stage 1  parse        → normalized text + chunks + figures + passages
-  → Stage 2  extract      → spans, negation, relations, modifiers
+  → Stage 2a NER          → spans + negation
+  → Stage 3  link         → CUIs + SNOMED/RxNorm URIs, and the span LABELS
+                            re-derived from each concept's semantic type
+  → Stage 2b extract      → relations, modifiers
              guards       → demote the relations that fail deterministic checks
-  → Stage 3  link         → CUIs + SNOMED/RxNorm URIs on every span
   → Stage 4  postcoord    → instance nodes for qualified mentions
   → Stage 5  images       → figure captions linked as depictions
   → Stage 6  assert       → named-graph RDF quads
   → Stage 7  reason       → materialized inferences, in their own graph
   → Stage 8  serve        → SPARQL + N-Quads serialization
 ```
+
+Stage 3 sits *inside* Stage 2 rather than after it. A span's label decides which
+relation types it can take part in, which candidate pairs are offered to the
+extractor, and whether the validator keeps what comes back — and the label is
+only trustworthy once the mention has been linked. Section 6 has the
+measurement.
 
 Stages 1, 4, 5, 6 and the guard layer are pure Python and fully testable
 offline. Stage 2 needs an LLM and NER models; Stage 3 needs a UMLS-derived FAISS
@@ -330,6 +338,20 @@ a span can carry the text `triiodothyronine` while the sentence says `T3`.
 Grounding therefore also accepts a co-referent mention of the same linked concept
 inside the quote.
 
+It over-fired for a second reason, which took a bigger corpus to see. The check
+ran against the quote, and **82% of the quotes in a ten-document run were not
+whole sentences**: extractors quote the clause that carries the relation and
+leave the subject in the one before it. `stimulates` was demoted for missing
+'PTH' over the quote "on kidneys to enhance calcium reabsorption"; `caused_by`
+for missing 'Inflammatory bowel disease' over "can lead to symptoms like
+abdominal pain and diarrhea". The entity is one clause to the left and the
+relation is sound.
+
+The check now runs over the quote **widened to the sentences it sits in**, which
+turns 581 demotions into 275 on that run — 306 relations that stay affirmed.
+What the guard is for survives the change: support must still be *local*, not
+assembled from across a 1,500-character chunk.
+
 ### Two rules that shape all of them
 
 **Demote, never delete.** Every guard sets `polarity = "uncertain"` and files a
@@ -374,6 +396,39 @@ across sources collapse to one node. This is the alignment step.
 BiomedCLIP, the obvious alternative, is an image–text model and solves a
 different problem.
 
+### Span labels come from here, not from NER
+
+The linked concept also settles the span's **ontology label**, which is why this
+stage runs before Stage 2's LLM passes rather than after them.
+
+NER is reliable at finding *where* a mention is and unreliable at saying *what
+kind of thing* it is, because a model outside its training domain fails
+confidently. `en_ner_bionlp13cg_md` was trained on cancer genetics, so on an
+anatomy corpus it reads `abdominal cavity`, `pelvic floor` and `bloodstream` as
+`PATHOLOGICAL_FORMATION` and `thyroid gland` as `CANCER`; `en_ner_bc5cdr_md`
+calls every gland a `DISEASE`. In a ten-document run that was **1,414 of 1,965
+relation rejections — 72%** — concentrated on `part_of`, `located_in` and
+`composed_of`, which is what an anatomy corpus is made of.
+
+A surface-form override list is not the fix: those rejections spread over 482
+distinct (surface, label) pairs, and the top sixty cover only half of them. The
+UMLS semantic type is one mechanism that covers all of them, and it is a
+property of a concept the pipeline is already resolving.
+
+`semantic_types.json` beside the index maps CUI → TUIs (built from `MRSTY.RRF`,
+which `build_index.py --semantic-types-only` will add to an existing index
+without re-embedding anything). `config.SEMANTIC_TYPE_LABELS` maps TUI → span
+label and `SEMANTIC_TYPE_PRIORITY` breaks ties, **most specific first**: insulin
+is a peptide, a hormone and a pharmacologic substance at once, and because the
+label hierarchy only ever weakens upward, the specific answer is the one that
+keeps the most relation types reachable.
+
+Two properties keep this honest. The original label is preserved on
+`Span.ner_label`, so the graph can always say what it overrode — an override
+that decides which relations may fire cannot be invisible. And a concept with no
+mapped semantic type keeps the NER label rather than being forced into one; an
+index with no sidecar at all skips the pass and says so.
+
 **URI choice.** `cui_to_uri` prefers RxNorm, then SNOMED, then the raw UMLS CUI
 URI. Only drug concepts carry RxNorm codes, so preferring RxNorm routes drugs to
 RxNorm and everything else to SNOMED without needing a type check.
@@ -402,9 +457,24 @@ inst:7f49bd589122  a sct:29857009 ;                      # chest pain
     rdfs:label "chest pain [severe]" .
 ```
 
-Instance ids are `det_id(source, char_offset, cui)`, so re-running is idempotent.
-Modifier values resolve via the Stage-3 link, then a configured lexicon, then a
-review-flagged fallback. Negated spans get no instance.
+Instance ids are `det_id(source, cui, attributes)`, so re-running is idempotent
+*and* two mentions that mean the same thing share one node. Keying on the
+character offset instead made every occurrence its own node, which is how
+`Addison's disease caused_by cortisol [deficiency]` and `... Cortisol
+[deficiency]` came back as two rows of the `relations` query for one fact — the
+per-occurrence shattering this section warns about below, arriving through the
+identity function rather than through the modifier set. Negated spans get no
+instance.
+
+**Modifier values resolve from the ontology lexicon first**, and a role-changing
+value will not accept a Stage-3 link at all. A deviation value is a closed
+vocabulary of about thirty surface forms; asking the linker to resolve a bare
+qualifier word with no useful context returns whatever is nearest in embedding
+space, which in a real run meant `hasDeviation sct:36976004`
+(Hypoparathyroidism, a disease) for "not enough PTH" and `sct:88323005`
+(Adequate) for "adequate". `ont:Deficiency`, the value the ontology defines for
+exactly this, was used **zero times in all 73 instances**. Off-lexicon
+deviations now go to review rather than to a plausible-looking wrong code.
 
 ### The deviation modifier
 
@@ -429,7 +499,19 @@ inverse of the source, and the opposite of the clinical advice.
 Drug and Protein. A run attached `deviation: excess` to the span
 "hyperthyroidism" and minted `hyperthyroidism [excess]` as a second subject node,
 asserting one fact twice under two URIs. A disease *is* a deviation; it cannot
-take one. A misapplied modifier is reported rather than silently modelled.
+take one. A misapplied modifier is reported and **modelled nowhere** — for a
+while it was reported *and* written, so `Hypoparathyroidism`, `Cushing's
+syndrome`, `Acromegaly` and `Dwarfism` each got an unlabelled instance carrying
+`hasDeviation` beside the review entry saying the modifier did not belong there.
+Reporting a thing you then do anyway is not reporting it.
+
+Two more shapes are refused the same way. **Deviations that contradict each
+other** — one span carrying both `deficiency` and `excess` — describe nothing,
+and only antonym pairs count, so insulin deficiency and insulin resistance are
+still both recorded. And a **deviation the span already states**: "Iodine
+deficiency" links to a concept that denotes the deficiency, so attaching
+`deviation: deficiency` on top mints a second node for it and asserts it against
+the plain concept, which is where `ADH deficiency caused_by ADH` came from.
 
 **Labels prefer words to codes.** Stage 3 links modifier values, so composing a
 label from the resolved URI produced `iodine [260372006]` — technically correct
@@ -661,13 +743,17 @@ each with a head and tail label constraint, a URI, and a **gloss** that is promp
 material rather than documentation — the glosses are what the model reads.
 
 **Type constraints are hierarchical.** A `label_hierarchy` declares `Drug ⊑
-Substance`, `MultiTissueStructure ⊑ BodyStructure`, `AnatomicalSystem ⊑
-BodyStructure`, and a constraint is satisfied by the label or any ancestor. This
-exists for a measured reason: bc5cdr maps every CHEMICAL to `Drug`, so in one run
-115 of 539 spans could not satisfy a single `Substance` constraint, and 127
-otherwise-valid relations were discarded on type grounds. Subsumption is
-deliberately one-way — `treated_with` still demands a real `Drug`, and a bare
-`Substance` will not do.
+Substance`, `Protein ⊑ Substance`, `MultiTissueStructure ⊑ BodyStructure`,
+`AnatomicalSystem ⊑ BodyStructure`, and a constraint is satisfied by the label
+or any ancestor. This exists for a measured reason: bc5cdr maps every CHEMICAL
+to `Drug`, so in one run 115 of 539 spans could not satisfy a single `Substance`
+constraint, and 127 otherwise-valid relations were discarded on type grounds.
+`Protein ⊑ Substance` is the same argument one step on: once labels come from
+semantic types, a peptide hormone resolves to `Protein`, and `treated_with`
+requires `Drug` or `Substance` — so insulin as a treatment was unrepresentable
+until proteins subsumed to substances. Subsumption is deliberately one-way —
+`treated_with` still demands a real `Drug` or a substance, `catalyzes` still
+demands a real `Protein`, and a bare `Substance` will not do for either.
 
 **A constraint that contradicts its own gloss is a bug in the constraint.**
 `catalyzes` accepted `['Protein', 'Substance']` as a head while its gloss said
@@ -772,12 +858,15 @@ reusable asset built once, not a per-run output.
 
 These are properties of the pipeline as it stands.
 
-**NER labels are the dominant constraint bottleneck.** In one run 104 of 111 type
-rejections traced to mislabelled spans, and 55 to a single family: bc5cdr's
-DISEASE recognizer fires on the document's central noun phrase, so `thyroid
-gland`, `thyroid hormone` and `thyroid peroxidase` all come back as `Disease`.
-The graph stays model-driven — these are reported rather than overridden — so
-they remain visible in the review queue.
+**NER labels were the dominant constraint bottleneck**, and are now overridden
+rather than merely reported. bc5cdr's DISEASE recognizer fires on the document's
+central noun phrase, so `thyroid gland`, `thyroid hormone` and `thyroid
+peroxidase` all come back as `Disease`; bionlp13cg reads anatomical cavities as
+`PATHOLOGICAL_FORMATION`. Section 6 covers the replacement. What remains is the
+residue: a span whose concept carries no mapped semantic type keeps its NER
+label, and a *link* that is confidently wrong now propagates into the span type
+as well as the node identity — one authority instead of two disagreeing ones,
+which is better but not free.
 
 **The guards are lexicons.** They will miss phrasings not in their cue lists, and
 will occasionally fire on a sound relation. That is the intended direction of

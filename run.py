@@ -5,16 +5,20 @@ Modes:
                produces -> a tag-free normalized text file (the provenance
                anchor every chunk offset indexes into) + the Stage-1 IR JSON.
                Tags map onto chunk kinds, so no LLM and no network are involved.
-  stage3       Stages 3+5 only: a Stage-2 IR JSON -> linked IR JSON. Use this
-               rather than re-running `full` after a Stage-3 failure; Stage 2's
-               LLM calls are the expensive part and there is no reason to pay
-               for them twice.
+  stage3       Stages 3+5 only: an IR carrying spans -> linked IR JSON. Use this
+               rather than re-running `full` after a Stage-3 failure; the LLM
+               calls are the expensive part and there is no reason to pay for
+               them twice.
   stage2       Stage 2 only (NER + LLM modifiers + LLM relations), starting from
                a Stage-1 IR; writes the enriched IR as JSON. Needs scispaCy + an
                LLM backend, but NOT the UMLS index — use it to iterate on Stage 2
-               (fragments, Meditron) in isolation.
+               (fragments, Meditron) in isolation. Note that it therefore
+               extracts against RAW NER LABELS: a `full` or `corpus` run puts
+               Stage 3 in between the two halves of Stage 2 so the extractor
+               works from labels reconciled against the linked concept.
   full         Stages 2->8. Also needs a built SapBERT/FAISS index (see
-               stage3_link.build_index).
+               stage3_link.build_index). Stage order is NER -> Stage 3 (link and
+               reconcile labels) -> the LLM passes -> Stages 5 to 8.
   from-stage3  Stages 4,6,7,8 only, starting from an already-linked IR
                (sample_stage3_output.json). Needs only rdflib + owlrl — no
                models, no network. Use this to see the graph-building half run.
@@ -117,31 +121,79 @@ def run_from_stage3(doc: Document, report: dict = None):
     return doc, ds, inferred, graph
 
 
-def run_stage3(doc: Document, index_dir: str, rerank=None) -> Document:
-    """Stages 3 and 5: link mentions, then bridge figure captions.
+class LinkerCache:
+    """Builds the SapBERT/FAISS linker once and hands the same one to everybody.
 
-    Separable from `full` on purpose. Stage 3 loads faiss and torch into one
-    process, which is where native-library crashes happen; without a resume
-    point, one of those costs you the entire Stage-2 LLM pass as well.
+    The index is gigabytes and takes tens of seconds to read; a ten-document
+    corpus run used to pay that ten times over because each document built its
+    own. Construction stays lazy so a run that never reaches Stage 3 (a parse
+    failure, `--mode stage1`) never loads torch at all.
     """
-    from medkg import stage3_link, stage5_images
+
+    def __init__(self, index_dir: str):
+        self.index_dir = index_dir
+        self._linker = None
+
+    def get(self):
+        """The shared linker, constructed on first use."""
+        if self._linker is None:
+            from medkg import stage3_link
+            self._linker = stage3_link.SapBertLinker(self.index_dir)
+        return self._linker
+
+
+def run_stage3(doc: Document, linker, rerank=None) -> Document:
+    """Stage 3: link every mention, then re-derive span labels from the linked
+    concept's semantic type.
+
+    Runs between Stage 2's NER pass and its LLM passes. The label a span carries
+    decides which relation types it can take part in, which pairs are even
+    offered to the extractor, and whether the validator keeps what comes back --
+    so it has to be the linked concept's type, not an out-of-domain NER model's
+    guess. `stage3_link.reconcile_labels` has the measurement.
+    """
+    from medkg import stage3_link
     started_at = time.time()
     console.announce_stage(3, "link",
                            "mentions -> UMLS concepts (SapBERT + FAISS)")
-    linker = stage3_link.SapBertLinker(index_dir)
     doc = stage3_link.link_document(doc, linker, rerank=rerank)
+    doc = stage3_link.reconcile_labels(doc, linker)
     console.announce_finished("stage 3", started_at)
+    return doc
+
+
+def run_stage5(doc: Document, linker, rerank=None) -> Document:
+    """Stage 5: link the modifier values Stage 2 just found, then bridge figure
+    captions into depiction edges."""
+    from medkg import stage3_link, stage5_images
+    doc = stage3_link.link_modifiers(doc, linker)
     return stage5_images.bridge_figures(doc, linker=linker, rerank=rerank)
+
+
+def run_stages_2_to_5(doc: Document, linker, call_llm=None,
+                      rerank=None) -> Document:
+    """NER -> link + reconcile labels -> LLM modifiers and relations -> figures.
+
+    The one place the interleaved order is written down. Stage 3 sits inside
+    Stage 2 rather than after it, so everything downstream of NER works from a
+    reconciled label.
+    """
+    from medkg import stage2_extract
+    doc = stage2_extract.run_ner(doc)
+    doc = run_stage3(doc, linker, rerank=rerank)
+    kw = {} if call_llm is None else {"call_llm": call_llm}
+    doc = stage2_extract.run_llm(doc, **kw)
+    return run_stage5(doc, linker, rerank=rerank)
 
 
 def run_full(doc: Document, index_dir: str, call_llm=None, rerank=None,
              report: dict = None):
-    doc = run_stage2(doc, call_llm=call_llm)                       # Stage 2
-    doc = run_stage3(doc, index_dir, rerank=rerank)                # Stages 3 + 5
+    linker = LinkerCache(index_dir).get()
+    doc = run_stages_2_to_5(doc, linker, call_llm=call_llm, rerank=rerank)
     return run_from_stage3(doc, report=report)
 
 
-def _extract_one(md_path: str, paths: dict, index_dir: str, call_llm=None,
+def _extract_one(md_path: str, paths: dict, linker_cache, call_llm=None,
                  rerank=None, figures_dir="", figures_ext="",
                  verify_figures=False, resume=True) -> Document:
     """Stages 1-5 for ONE document of a corpus, into its own artifact directory.
@@ -149,6 +201,8 @@ def _extract_one(md_path: str, paths: dict, index_dir: str, call_llm=None,
     Stops at the linked IR rather than building RDF: the whole point of a corpus
     run is that Stage 6 sees every document at once, so it can name one label per
     concept and refuse a source_id collision before anything is written.
+
+    `linker_cache` is a `LinkerCache`, so ten documents share one loaded index.
     """
     if resume and os.path.exists(paths["ir"]):
         if os.path.getmtime(paths["ir"]) >= os.path.getmtime(md_path):
@@ -167,11 +221,18 @@ def _extract_one(md_path: str, paths: dict, index_dir: str, call_llm=None,
     doc.to_json(paths["stage1"])
     console.announce_step(f"stage-1 IR -> {paths['stage1']}")
 
-    doc = run_stage2(doc, call_llm=call_llm)
+    from medkg import stage2_extract
+    doc = stage2_extract.run_ner(doc)
+    doc = run_stage3(doc, linker_cache.get(), rerank=rerank)
+    # The checkpoint sits after linking now, not after the LLM passes: the LLM
+    # passes are the hours, and resuming into them needs the reconciled labels
+    # they were going to run against.
     doc.to_json(paths["stage2"])
-    console.announce_step(f"stage-2 checkpoint -> {paths['stage2']}")
+    console.announce_step(f"NER + linked checkpoint -> {paths['stage2']}")
 
-    doc = run_stage3(doc, index_dir, rerank=rerank)
+    kw = {} if call_llm is None else {"call_llm": call_llm}
+    doc = stage2_extract.run_llm(doc, **kw)
+    doc = run_stage5(doc, linker_cache.get(), rerank=rerank)
     doc.to_json(paths["ir"])
     console.announce_step(f"linked IR -> {paths['ir']}")
     return doc
@@ -189,6 +250,7 @@ def run_corpus(inputs, index_dir: str, declared_groups: dict = None,
 
     docs: list[Document] = []
     started_at = time.time()
+    linker_cache = LinkerCache(index_dir)
     for i, md_path in enumerate(inputs, start=1):
         stem = corpus.stem_of(md_path)
         print()
@@ -199,7 +261,8 @@ def run_corpus(inputs, index_dir: str, declared_groups: dict = None,
         outer = console.set_base_indent_level(1)
         try:
             docs.append(_extract_one(
-                md_path, corpus.doc_artifacts(stem), index_dir, call_llm=call_llm,
+                md_path, corpus.doc_artifacts(stem), linker_cache,
+                call_llm=call_llm,
                 rerank=rerank, figures_dir=figures_dir, figures_ext=figures_ext,
                 verify_figures=verify_figures, resume=resume))
         finally:
@@ -524,7 +587,9 @@ def main():
                 "error: input has no spans -- Stage 2 has not run on it, so there\n"
                 "       is nothing for Stage 3 to link.\n")
             raise SystemExit(2)
-        doc = run_stage3(doc, args.index_dir, rerank=rerank)
+        linker = LinkerCache(args.index_dir).get()
+        doc = run_stage3(doc, linker, rerank=rerank)
+        doc = run_stage5(doc, linker, rerank=rerank)
         outfile = args.out if args.out.endswith(".json") else config.artifact_path("stage3_output.json")
         doc.to_json(outfile)
         linked = sum(1 for s_ in doc.spans if s_.uri)
@@ -550,15 +615,21 @@ def main():
         return
 
     if args.mode == "full":
-        # Checkpoint between the expensive stage and the fragile one. Stage 2 is
-        # ~50 LLM calls; Stage 3 loads FAISS and SapBERT and reaches the network
-        # again. Without this, a Stage-3 failure discards all of Stage 2 -- which
-        # has now happened twice.
-        doc = run_stage2(doc, call_llm=call_llm)
+        # Checkpoint between the fragile stage and the expensive one. Stage 3
+        # loads FAISS and SapBERT and reaches the network; the LLM passes that
+        # follow it are ~100 calls. Saving in between means a failure in either
+        # does not discard the other, and the file holds the reconciled labels
+        # the LLM passes were about to run against.
+        from medkg import stage2_extract
+        linker = LinkerCache(args.index_dir).get()
+        doc = stage2_extract.run_ner(doc)
+        doc = run_stage3(doc, linker, rerank=rerank)
         ckpt = (args.out.rsplit(".", 1)[0] if "." in args.out else args.out) + ".stage2.json"
         doc.to_json(ckpt)
-        console.announce_step(f"stage-2 checkpoint -> {ckpt}")
-        doc = run_stage3(doc, args.index_dir, rerank=rerank)
+        console.announce_step(f"NER + linked checkpoint -> {ckpt}")
+        kw = {} if call_llm is None else {"call_llm": call_llm}
+        doc = stage2_extract.run_llm(doc, **kw)
+        doc = run_stage5(doc, linker, rerank=rerank)
         doc, ds, inferred, graph = run_from_stage3(doc, report=reasoner_report)
     else:
         doc, ds, inferred, graph = run_from_stage3(doc, report=reasoner_report)

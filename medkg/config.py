@@ -108,13 +108,30 @@ ROLE_CHANGING_MODIFIERS: tuple = ("deviation",)
 # the instance) but do NOT redirect the relation endpoint.
 DEVIATION_APPLIES_TO: tuple = ("Substance", "Drug", "Protein")
 
-# --- Fallback lexicon for common modifier VALUES ----------------------------
-# Used when a modifier value can't be linked by the linker.
+# --- Lexicon for modifier VALUES --------------------------------------------
+# Consulted BEFORE the Stage-3 link, and the only source accepted for a
+# role-changing modifier: a deviation value is a closed vocabulary, and asking
+# the linker to resolve a bare "deficiency" with no context returns whatever
+# SNOMED concept is nearest in embedding space, which in one run was a disease.
 MODIFIER_VALUE_LEXICON: dict[str, str] = ONTOLOGY["modifier_values"]
+# Value pairs that cannot both hold of one mention -- deficiency and excess.
+MODIFIER_VALUE_ANTONYMS: frozenset = ONTOLOGY["modifier_value_antonyms"]
 
 # NER model -> {raw label: ontology span label}. A relation can only fire if
 # some model here emits both of its endpoint labels.
+#
+# These are the labels a span STARTS with. Stage 3 re-derives them from the
+# linked concept's UMLS semantic type wherever it can (`SEMANTIC_TYPE_LABELS`),
+# because an NER model outside its training domain gets this badly wrong: on an
+# anatomy corpus bionlp13cg tags cavities as PATHOLOGICAL_FORMATION and glands
+# as CANCER, which was 72% of one run's relation rejections.
 NER_LABEL_MAPS: dict[str, dict] = ONTOLOGY["ner_models"]
+
+# UMLS semantic type (TUI) -> ontology span label, and the order to prefer them
+# in when a concept carries several. Needs `semantic_types.json` beside the
+# FAISS index; without it Stage 3 leaves the NER label alone.
+SEMANTIC_TYPE_LABELS: dict[str, str] = ONTOLOGY["semantic_types"]
+SEMANTIC_TYPE_PRIORITY: tuple = ONTOLOGY["semantic_type_priority"]
 NER_MODELS: tuple = tuple(
     os.environ.get("MEDKG_NER_MODELS", "en_ner_bc5cdr_md").split(","))
 

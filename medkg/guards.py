@@ -195,6 +195,67 @@ def _evidence_text(doc, rel, head) -> str:
     return chunk.text[a:b]
 
 
+SENTENCE_ENDS = ".!?\n"
+
+
+def sentence_window(text: str, start: int, end: int) -> tuple[int, int]:
+    """Widen [start, end) to the sentence(s) it falls inside. Pure; stdlib only.
+
+    `text` is the chunk, `start`/`end` are offsets into it. Returns the widened
+    pair, clipped to the chunk. A quote already spanning whole sentences comes
+    back unchanged.
+    """
+    left = start
+    while left > 0 and text[left - 1] not in SENTENCE_ENDS:
+        left -= 1
+    right = end
+    while right < len(text) and text[right - 1] not in SENTENCE_ENDS:
+        right += 1
+    return left, right
+
+
+def _evidence_scope(doc, rel, head) -> tuple[int, int]:
+    """The document-offset range the cited quote is taken to support.
+
+    The quote itself is not that range. Extractors quote the clause that carries
+    the relation and leave the subject in the one before it -- 82% of the quotes
+    in a ten-document run were not whole sentences, and the demotions that
+    produced read like `stimulates` missing 'PTH' over the quote "on kidneys to
+    enhance calcium reabsorption". The entity is one clause to the left, in the
+    same sentence, and the relation is sound.
+
+    Widening to sentence boundaries keeps what the check is actually for -- the
+    support must be LOCAL, not gathered from across a 1,500-character chunk --
+    while dropping a requirement the prompt cannot reliably enforce. Returns
+    (start, end) in document offsets, or the raw quote range when the chunk
+    cannot be recovered.
+    """
+    chunk = _chunk_for(doc, head)
+    if chunk is None or rel.evidence_start is None or rel.evidence_end is None:
+        return rel.evidence_start, rel.evidence_end
+    a = rel.evidence_start - chunk.char_start
+    b = rel.evidence_end - chunk.char_start
+    if a < 0 or b > len(chunk.text) or a >= b:
+        return rel.evidence_start, rel.evidence_end
+    left, right = sentence_window(chunk.text, a, b)
+    return chunk.char_start + left, chunk.char_start + right
+
+
+def _evidence_scope_text(doc, rel, head) -> str:
+    """The text of `_evidence_scope`, for the surface-form tests.
+
+    '' when the chunk cannot be recovered.
+    """
+    chunk = _chunk_for(doc, head)
+    start, end = _evidence_scope(doc, rel, head)
+    if chunk is None or start is None or end is None:
+        return ""
+    a, b = start - chunk.char_start, end - chunk.char_start
+    if a < 0 or b > len(chunk.text) or a >= b:
+        return ""
+    return chunk.text[a:b]
+
+
 def _demote(doc, rel, stage: str, reason: str, **extra) -> dict:
     """Mark a relation uncertain and file it for review. Idempotent."""
     rel.polarity = "uncertain"
@@ -255,15 +316,19 @@ def flag_ungrounded_endpoints(doc) -> list[dict]:
 
     A concept may legitimately occur several times in a chunk and the linked
     span may be a different occurrence than the quoted one, so offset
-    containment OR a surface-form match in the quote both count as grounded.
+    containment OR a surface-form match both count as grounded.
+
+    All three tests run over `_evidence_scope` — the quote widened to the
+    sentences it sits in — rather than over the quote itself. See that function
+    for the measurement that motivated it.
     """
     # every mention of each concept, so an abbreviation counts as its expansion
     by_concept: dict[str, list] = {}
     for sp in doc.spans:
         by_concept.setdefault(concept_of(sp), []).append(sp)
 
-    def mentioned_in_quote(rel, span) -> bool:
-        """Is this CONCEPT inside the cited quote, under any of its surface forms?
+    def mentioned_in_scope(rel, span, start, end) -> bool:
+        """Is this CONCEPT inside [start, end), under any of its surface forms?
 
         Offsets first, then the span's own text, then any co-referent mention.
         The third test matters because scispacy resolves abbreviations: a span
@@ -272,14 +337,15 @@ def flag_ungrounded_endpoints(doc) -> list[dict]:
         stated twice in one chunk, where the linked span may be a different
         occurrence than the quoted one.
         """
-        if rel.evidence_start <= span.char_start and span.char_end <= rel.evidence_end:
+        if start is None or end is None:
+            return False
+        if start <= span.char_start and span.char_end <= end:
             return True
-        evidence = _evidence_text(doc, rel, span)
-        if evidence and span.text.lower() in evidence.lower():
+        scope = _evidence_scope_text(doc, rel, span)
+        if scope and span.text.lower() in scope.lower():
             return True
         return any(other.span_id != span.span_id
-                   and rel.evidence_start <= other.char_start
-                   and other.char_end <= rel.evidence_end
+                   and start <= other.char_start and other.char_end <= end
                    for other in by_concept.get(concept_of(span), ()))
 
     out = []
@@ -292,14 +358,17 @@ def flag_ungrounded_endpoints(doc) -> list[dict]:
         evidence = _evidence_text(doc, rel, head)
         if not evidence:
             continue
+        start, end = _evidence_scope(doc, rel, head)
         for role, span in (("head", head), ("tail", tail)):
-            if span is None or mentioned_in_quote(rel, span):
+            if span is None or mentioned_in_scope(rel, span, start, end):
                 continue
             out.append(_demote(
                 doc, rel, "re-evidence-scope",
                 f"cited evidence does not mention the {role} "
-                f"({span.text!r}); the quote cannot support this relation",
-                evidence=evidence, missing=span.text))
+                f"({span.text!r}); neither the quote nor the sentence around "
+                f"it can support this relation",
+                evidence=evidence, missing=span.text,
+                scope=_evidence_scope_text(doc, rel, head)))
             break
     return out
 

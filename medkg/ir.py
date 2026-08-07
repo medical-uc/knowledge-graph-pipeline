@@ -43,12 +43,17 @@ class Span:
     text: str
     char_start: int
     char_end: int
-    label: str                      # entity type from NER (Disease, Drug, Symptom, ...)
+    label: str                      # entity type (Disease, Drug, Symptom, ...)
     negated: bool = False           # Stage 2 (negspacy)
     modifiers: list[Modifier] = field(default_factory=list)
     cui: Optional[str] = None       # Stage 3
     uri: Optional[str] = None       # Stage 3 (ontology URI)
     link_score: Optional[float] = None
+    # What NER originally called this span, kept when Stage 3 re-derived `label`
+    # from the linked concept's semantic type. Empty when the two agreed or no
+    # reconciliation ran. The override decides which relation types the span can
+    # take part in, so the graph has to stay able to show what it overrode.
+    ner_label: str = ""
 
 
 @dataclass
