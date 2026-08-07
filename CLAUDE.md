@@ -19,9 +19,6 @@ directory.
   progress bars like `tqdm` because they can break on some terminals. Always use
   numbers that are batched; e.g., `10/100`, `20/100`, depending on how many
   items there are to process to indicate progress.
-- Comments in the code should not address changes that I get from you. Write
-  them as if the code's been like that from the start.
-- Never make Git PRs on your own.
 
 ## Changelog Maintenance Rules
 
