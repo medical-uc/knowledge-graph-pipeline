@@ -4,3 +4,6 @@ umls_index/
 UMLS/
 inputs/
 .venv/
+.claude/
+__pycache__/
+sync.sh
