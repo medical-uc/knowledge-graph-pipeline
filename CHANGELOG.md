@@ -87,8 +87,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instance hashes, so a collision silently mints one document's instance nodes
   onto another's.
 
+### Added
+
+- `mcq.cap_key_repeats` limits how much of a paper one answer may key, to
+  `mcq.MAX_KEY_SHARE` of the items with a floor of `mcq.MIN_KEY_REPEATS`. A hub
+  concept collects containment edges from everything around it and every edge
+  was an item, so `pelvis` keyed 8 of 69 on a pelvic floor document and its top
+  five answers covered half the paper. What that buys a candidate is a strategy:
+  answer the hub whenever unsure. Held to a tenth of the paper it pays worse
+  than picking at random from five options.
+
+  Counted on the concept and its deviations rather than the printed text, so
+  two spellings of one concept count together while `iodine` and `iodine
+  deficiency` stay apart. Within an over-represented answer the best-attested
+  items survive: highest confidence, then longest rationale, then the stem for
+  a stable rerun. The cap is computed from the pre-cap count and applied once,
+  because recomputing against the survivors would ratchet — each drop shrinks
+  the paper, tightening the cap, dropping more.
+
+  `Item.item_id` is now assigned after the cap rather than during assembly, so
+  a paper is numbered without gaps.
+- `mcq.question_class` groups predicates by the question they ask rather than
+  the relation they store, and `one_per_question` now folds on that. In the
+  ontology `located_in` and `part_of` are distinct; at the point of asking both
+  are "which structure", so a head carrying one of each was asked twice. On a
+  pelvic floor document those two predicates were 66 of 69 items, and the pair
+  "Which structure includes the pelvic inlet?" / "In which structure is the
+  pelvic inlet located?" keyed `pelvis` in both.
+- `mcq.resolve_stem_collisions` runs after rephrasing and reverts a rewrite
+  that duplicated another item's stem back to its template, dropping the
+  lower-confidence item if the two still collide. `accept_stem` judges a
+  rewrite against its own options and cannot see the rest of the paper, and
+  batching makes regularisation likelier still: the model sees ten related
+  stems at once and pulls them towards each other, which is how two items came
+  to read "Which structure includes the sacrum?" with keys `coccyx` and
+  `pelvis`. `generate` now returns the surviving list, so callers must use what
+  it returns rather than the list handed to `phrase_items`.
+- `mcq.supports_item` requires a rationale to be a statement with a finite verb
+  that names at least one endpoint, and `evidence_text` first grows the stored
+  offsets out to the enclosing sentence. The offsets clip to what the extractor
+  matched, so a bulleted list yielded rationales reading `Aorta` and `Pancreas
+  (except the tail)` — true facts that justify nothing to the candidate. 22 of
+  69 rationales on the pelvic floor document never mentioned their key. Naming
+  one endpoint rather than both is deliberate: a sentence often carries the
+  head only as a pronoun, and demanding both would drop sound items over
+  anaphora this module cannot resolve.
+- `mcq.is_plural_head` agrees the copula in the `converts_to`, `located_in`,
+  `part_of` and `risk_factor_for` templates, which gained a `{copula}` field.
+  Template-only runs were emitting "Blood vessels is found within which
+  structure?". Classical forms are read as singular so `symphysis`, `hiatus`
+  and `hypothalamus` are not mistaken for plurals by a trailing `-s`.
+- `mcq.is_abbreviation`, used by `canonical_labels` to prefer a concept's
+  expanded surface form over its initialism. Choosing by frequency alone left
+  `GH` in a set beside `insulin` and `glucagon`, where the one option shaped
+  unlike its neighbours is the key given away — the same tell as the
+  sentence-initial capital, one level up. Judged on the first word, so `ADH
+  dysfunction` counts, and a capital with a digit counts, so `T3` does.
+- `mcq.one_per_question` collapses relations sharing a head concept and a
+  predicate to their best-attested member before any item is built. Three
+  relations under `osteoporosis caused_by` used to become three items, each of
+  which the blocklist made individually defensible while the paper asked "a
+  recognised cause of osteoporosis?" three times and keyed it `calcium`,
+  `vitamin D` and `bone`. The indefinite-article rule secures an item and not a
+  paper, and no per-item check can see the collision, so the grouping has to
+  happen during selection.
+- `mcq.leaked_option` replaces the one-directional substring test in
+  `accept_stem` and now runs against template stems too, which were never
+  checked because the guard was only reachable from the LLM rewrite path. It
+  compares content words in both directions, so a stem built on "Tertiary
+  hyperparathyroidism" no longer keys `hyperparathyroidism`, and "Cortical bone
+  is part of which structure?" no longer keys `bone`. A leaking distractor is
+  dropped and the item survives on spare candidates; only a leaking key is
+  fatal. `mcq.DISTRACTOR_OVERSHOOT` asks for those spares.
+- `mcq.usable_option` rejects labels that are grammatically spans but never
+  answers: direction and state adjectives (`posterior`, `cellular`) that link
+  cleanly to UMLS and carry a plausible label, section headings that survived
+  linking through their head noun (`Disorders of the parathyroid glands`), and
+  labels whose brackets do not balance, which is a span boundary landing inside
+  a parenthesis. Applied to the head and the key as well, since an item keyed
+  `cellular` cannot be rescued by swapping its distractors and one asking about
+  `Duodenum (` cannot be asked at all.
+- `mcq.too_close` rejects a distractor that restates the key, comparing the two
+  at the ends of the string only. `blood` beside a keyed `bloodstream` and
+  `inositol trisphosphate` beside a keyed `phosphate` both go; `thyroid gland`
+  against a keyed `parathyroid glands` stays, which a plain substring test
+  would have thrown away along with them.
+- `mcq.canonical_labels` and `mcq.tidy_label` settle one surface form per
+  concept and strip the capital or full stop a mention inherited from its
+  position in a sentence. An option that was capitalised because it opened a
+  sentence stood out from four lowercase ones and gave the key away with no
+  recall required; a document writing both `PTH` and `parathyroid hormone`
+  produced items that disagreed about what to call one concept. Deviations are
+  part of the identity, so `iodine` and `iodine deficiency` keep separate text.
+
 ### Changed
 
+- MCQ items now carry five options instead of four. `mcq.MIN_OPTIONS` is 5, and
+  `safe_distractors` defaults its `limit` to `MIN_OPTIONS - 1`, so an item needs
+  four safe distractors to survive. Items that cannot reach four are skipped
+  rather than padded, so the stricter requirement trades yield for the same
+  distractor-safety guarantee.
 - Stage 3 now runs between Stage 2's two halves rather than after it. A span's
   label decides which relation types it can take part in, which candidate pairs
   are offered to the extractor and whether the validator keeps what comes back,

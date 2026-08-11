@@ -814,12 +814,56 @@ failure` does not make it false. Three defences:
 
 Distractors are tiered — same-role siblings first, then the confusions the guards
 exist to catch (antonym pairs, deviation nodes), then same-semantic-type — and
-each item records which tier each distractor came from. Fewer than three safe
-distractors means no item; padding an option set is a giveaway, which is worse
-than generating nothing.
+each item records which tier each distractor came from. An item carries five
+options, so fewer than four safe distractors means no item; padding a set is a
+giveaway, which is worse than generating nothing.
+
+**Defence 3 secures an item, not a paper.** Relations sharing a head and a
+predicate each become an item that correctly hides the others, so all of them
+are individually defensible while the paper asks one question several times with
+several keys. No per-item check can see this, so relations are grouped and
+reduced to the best-attested one during selection.
+
+The grouping is by the question asked, not the predicate stored. `located_in`
+and `part_of` are distinct in the ontology and both come out as "which
+structure", so a head carrying one of each would be asked twice. Rephrasing can
+also collide two stems that started out distinct, and the stem guard only ever
+sees one item's own options, so a pass after the rewrite reverts a duplicated
+stem to its template and drops the weaker item if they still collide.
+
+**A rationale has to state the fact.** The stored evidence offsets clip to what
+the extractor matched, which on a bulleted list is a single cell: a rationale
+reading `Aorta` in full. The quote is grown out to its enclosing sentence and
+then has to be a statement, with a finite verb and at least one endpoint named,
+or the item is dropped. One endpoint rather than both, because a sentence often
+carries the head only as a pronoun.
+
+**No answer may key too much of the paper.** A hub concept collects containment
+edges from everything around it, and each edge is an item, so one answer can key
+a large share of a document's questions — which is a guessing strategy, not a
+question set. One answer is held to a tenth of the items, floored so that a
+short paper is not capped to nothing, keeping the strategy below what picking at
+random from five options pays. Counted per concept, so two spellings collapse
+and two deviations do not.
+
+Three further rules keep an option set honest. A label that is grammatically a
+span but never an answer is refused outright, for the key as much as for a
+distractor: direction and state adjectives link cleanly to UMLS, and a section
+heading survives linking through its head noun. A distractor that restates the
+key is refused, tested at the ends of the string so that `blood` against a keyed
+`bloodstream` goes while `thyroid gland` against a keyed `parathyroid glands`
+stays. And each concept gets one agreed surface form, expanded rather than
+abbreviated where the document offers both, with the capital, full stop or
+dangling bracket a mention inherited from its position stripped — because an
+option that looks unlike its four neighbours gives up the key without any
+recall, whether it is the only capitalised one or the only initialism.
+
+Stem templates agree their copula with the head, since a document full of
+`glands` and `vessels` otherwise yields "Blood vessels is found within which
+structure?" in any run without the rewrite pass.
 
 **Negative stems are refused in code, not merely discouraged in the prompt.**
-"All of the following EXCEPT" requires establishing that three statements are
+"All of the following EXCEPT" requires establishing that four statements are
 false, which an open-world graph cannot do about anything. The stem guard also
 rejects a rewrite that is not a question, exceeds 300 characters, or names the
 key *or any distractor*. Every rejection falls back to the template stem, so a
