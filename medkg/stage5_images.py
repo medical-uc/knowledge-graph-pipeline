@@ -69,12 +69,22 @@ def bridge_figures(doc: Document, nlp=None, linker=None, rerank=None,
     anatomy-dense — "thyroid cartilage", "follicular cells", "isthmus" — and
     `en_ner_bc5cdr_md` recognises none of those, so a single-model bridge finds
     almost nothing in exactly the text figures are made of.
+
+    Returns the document untouched when `config.BRIDGE_FIGURE_CAPTIONS` is off,
+    which is the current default; the figures themselves, their captions and
+    their `figureRef` edges are unaffected either way.
     """
     from .stage2_extract import load_pipelines
 
     started_at = time.time()
     console.announce_stage(5, "images",
                            "figure captions -> depicts edges")
+    if not config.BRIDGE_FIGURE_CAPTIONS:
+        console.announce_step("caption bridging is off "
+                              "(config.BRIDGE_FIGURE_CAPTIONS); figures keep "
+                              "their captions but gain no depicts edges")
+        console.announce_finished("stage 5", started_at)
+        return doc
     if not doc.figures:
         console.announce_step("no figures in this document; nothing to bridge")
         return doc
@@ -123,33 +133,52 @@ def bridge_figures(doc: Document, nlp=None, linker=None, rerank=None,
 # Quads (pure) — consumed by Stage 6
 # ---------------------------------------------------------------------------
 
-def figure_uri(fig_id: str) -> str:
-    return config.INST + "fig/" + fig_id
+def figure_uri(source_id: str, fig_id: str) -> str:
+    """The node standing for one figure.
+
+    Scoped by `source_id` because the rewriter numbers unnumbered figures with a
+    per-document counter (`fig-x6`), so the bare id collides across chapters the
+    moment two of them land in the same store.
+    """
+    return f"{config.INST}fig/{source_id}/{fig_id}"
 
 
 def build_depicts_quads(doc: Document, graph: str, figures=None) -> list[tuple]:
     """(s, p, o, g) for every figure: the node, its caption/description literals,
-    its source chunk, and one `ont:depicts` edge per linked concept. Pure stdlib
-    — mirrors `stage6_assert.build_quads`'s contract, `Lit` marks literals.
+    its label and panel, edges to the chunks that cite it and that restate it,
+    and one `ont:depicts` edge per linked concept. Pure stdlib — mirrors
+    `stage6_assert.build_quads`'s contract, `Lit` marks literals.
 
     `figures` narrows the set, so Stage 6 can call this once per section graph
     rather than dumping every figure in the document into one of them.
     """
-    from .stage6_assert import Lit
+    from .stage6_assert import Lit, chunk_uri
 
+    sid = doc.source.source_id
     quads: list[tuple] = []
     for fig in (doc.figures if figures is None else figures):
-        node = figure_uri(fig.fig_id)
+        node = figure_uri(sid, fig.fig_id)
         quads.append((node, config.RDF_TYPE, config.FIGURE_IMAGE, graph))
         if fig.image_path:
             quads.append((node, config.DCTERMS + "source", Lit(fig.image_path), graph))
+        if fig.label:
+            quads.append((node, config.RDFS_LABEL, Lit(fig.label), graph))
+            quads.append((node, config.FIGURE_LABEL, Lit(fig.label), graph))
+        if fig.panel:
+            quads.append((node, config.FIGURE_PANEL, Lit(fig.panel), graph))
         if fig.caption:
             quads.append((node, config.CAPTION, Lit(fig.caption), graph))
-        if fig.description:
-            # kept as a literal, not linked: it describes the rendering, not the medicine
+        if fig.description and not fig.content_chunk:
+            # kept as a literal, not linked: it describes the rendering, not the
+            # medicine. Once the description has become a chunk of its own the
+            # literal is pure duplication, and `figureContent` reaches the text.
             quads.append((node, config.VISUAL_DESCRIPTION, Lit(fig.description), graph))
         if fig.referenced_from:
-            quads.append((node, config.FIGURE_REF, Lit(fig.referenced_from), graph))
+            quads.append((node, config.FIGURE_REF,
+                          chunk_uri(sid, fig.referenced_from), graph))
+        if fig.content_chunk:
+            quads.append((node, config.FIGURE_CONTENT,
+                          chunk_uri(sid, fig.content_chunk), graph))
         for dep in fig.depicts:
             if dep.uri:
                 quads.append((node, config.DEPICTS, dep.uri, graph))

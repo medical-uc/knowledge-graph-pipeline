@@ -108,7 +108,9 @@ class Chunk:
     char_end: int
     section_path: list[str] = field(default_factory=list)
     kind: str = "prose"
-    figure_refs: list[str] = field(default_factory=list)  # [[FIG:id]] anchors lifted out of prose
+    # <figref>/<tblref> targets lifted out of the prose that cited them.
+    figure_refs: list[str] = field(default_factory=list)
+    table_refs: list[str] = field(default_factory=list)
     section_id: str = ""
 
 
@@ -143,6 +145,26 @@ class Depiction:
 
 
 @dataclass
+class Table:
+    """A `<tbl>` block: what identifies it, and what its grid became.
+
+    The rewriter restates a table's grid as standalone sentences, each naming
+    its own row and column, so that text is assertable on the same contract as
+    body prose and is chunked like it. `content_chunk` names the chunk holding
+    it. What stays here is what a chunk cannot carry: the `<tblref>` target id,
+    the printed label, and the caption, which names the table without asserting
+    anything and so is deliberately not extracted.
+    """
+    table_id: str
+    label: str = ""                     # "Table 2-1", when numbered
+    caption: str = ""
+    referenced_from: str = ""           # chunk id of the citing prose
+    content_chunk: str = ""             # chunk id holding the restated grid
+    caption_span: Optional[list[int]] = None
+    section_id: str = ""
+
+
+@dataclass
 class Figure:
     fig_id: str
     image_path: str
@@ -150,6 +172,11 @@ class Figure:
     referenced_from: str = ""
     marker: str = ""                    # verbatim source marker, e.g. "[FIGURE:p2_b3]"
     description: str = ""               # <desc> text (Stage 1)
+    label: str = ""                     # "Figure 2-1", when numbered
+    panel: str = ""                     # "A"/"B" on an unnumbered diagram
+    # Chunk holding <desc>, when the rewriter had structured content to restate.
+    # Empty for an image-only figure, which is most of them.
+    content_chunk: str = ""
     # [start, end] into the normalized file. The caption and description are not
     # chunks -- they would be pure duplication of these two fields -- but they
     # are still written to the normalized file, so a depicts edge can point at
@@ -166,6 +193,7 @@ class Document:
     source: Source
     chunks: list[Chunk] = field(default_factory=list)
     figures: list[Figure] = field(default_factory=list)
+    tables: list[Table] = field(default_factory=list)
     spans: list[Span] = field(default_factory=list)
     relations: list[Relation] = field(default_factory=list)
     instances: list[Instance] = field(default_factory=list)
@@ -191,6 +219,12 @@ class Document:
         for f in self.figures:
             if f.fig_id == fig_id:
                 return f
+        return None
+
+    def table_by_id(self, table_id: str) -> Optional[Table]:
+        for t in self.tables:
+            if t.table_id == table_id:
+                return t
         return None
 
     def sections(self) -> list[tuple[str, list[str]]]:
@@ -252,6 +286,7 @@ class Document:
             mods = [build(Modifier, m) for m in s.get("modifiers", [])]
             spans.append(build(Span, {k: v for k, v in s.items() if k != "modifiers"},
                                modifiers=mods))
+        tables = [build(Table, t) for t in d.get("tables", [])]
         passages = [build(Passage, p) for p in d.get("passages", [])]
         relations = [build(Relation, r) for r in d.get("relations", [])]
         instances = []
@@ -261,7 +296,8 @@ class Document:
                                               if k != "attributes"}, attributes=attrs))
         return cls(
             doc_id=d["doc_id"], source=src, chunks=chunks, figures=figures,
-            spans=spans, relations=relations, instances=instances,
+            tables=tables, spans=spans, relations=relations,
+            instances=instances,
             passages=passages, needs_review=d.get("needs_review", []),
             source_path=d.get("source_path", ""),
             normalized_path=d.get("normalized_path", ""),

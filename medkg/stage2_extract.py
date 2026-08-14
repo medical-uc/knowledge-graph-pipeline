@@ -11,10 +11,12 @@ corrupting the graph.
 
 Stage 2 only ever reads chunks whose `kind` is in
 `config.EXTRACTABLE_CHUNK_KINDS` — prose, definitions, key points, clinical
-notes and the closing summary. Captions and figure descriptions are tagged by
-Stage 1 and belong to Stage 5 (prose about how a picture looks must never become
-a clinical fact); learning objectives, references and deduplicated repeats are
-excluded outright.
+notes, the closing summary and a table's restated grid. Captions are tagged by
+Stage 1 and belong to Stage 5: text that merely names a picture must never
+become a clinical fact. Learning objectives, references and deduplicated repeats
+are excluded outright. A figure's restated diagram is chunked as
+`figure_content` but currently left out of that tuple, so no figure text reaches
+this stage at all.
 
 `looks_structured()` still matters. Stage 1 no longer restructures anything —
 the upstream rewriter owns that — so a <con> block the rewriter returned as a

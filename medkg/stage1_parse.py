@@ -8,17 +8,35 @@ distributing headings, guarding a rewrite — is done structurally upstream by
 the tags. So this stage does no rewriting, makes no LLM calls, and reaches no
 judgement about what any passage means. It maps tags onto chunk kinds:
 
-    <con>   -> prose               <cap>  -> caption
-    <def>   -> definition          <desc> -> figure_description
-    <key>   -> keypoint            <tbl>  -> table
-    <clin>  -> clinical            <ref>  -> reference
-    <sum>   -> summary             <obj>  -> objective
+    <con>       -> prose           <cap>       -> caption
+    <def>       -> definition      <tbl><cap>  -> table_caption
+    <key>       -> keypoint        <tbl><con>  -> table
+    <clin>      -> clinical        <ref>       -> reference
+    <sum>       -> summary         <obj>       -> objective
+    <desc>      -> figure_content
 
-Only assertable text becomes a `Chunk`. Captions and descriptions are stored on
-the `Figure` — chunking them as well was pure duplication that no stage read.
-Objectives, tables and bibliography become `Passage`s: retained, with offsets,
-but never assertable. All of it is still written to the normalized file, so
-every piece of the document has a position even when it is not a chunk.
+Only assertable text becomes a `Chunk`. A `<desc>` and a `<tbl>`'s `<con>` are
+assertable: the rewriter restates a diagram and a grid as standalone sentences
+on the same one-claim-per-sentence contract as body prose. A `<cap>` is not, so
+captions are stored on the `Figure` or `Table` instead, and objectives and
+bibliography become `Passage`s: retained, with offsets, but never assertable.
+All of it is still written to the normalized file, so every piece of the
+document has a position even when it is not a chunk.
+
+Inline markup (`<figref>`, `<tblref>`, `<sup>`, `<sub>`) is unwrapped by
+`normalize_inline` before the block parse, because it belongs inside a sentence
+rather than between elements. Cross-references survive the unwrap as
+`[[FIG:id]]` / `[[TBL:id]]` anchors, which `lift_anchors` then moves onto the
+citing chunk so the prose keeps exact offsets.
+
+LaTeX gets one of two treatments. A sentence of body text carrying a math span
+never becomes chunk text, because a formula reaches the extractor as a single
+opaque token; `drop_formula_sentences` removes it from prose, from a restated
+grid and from a `<desc>`, and `config.DROP_FORMULA_SENTENCES` turns that off. A
+heading, a caption, an objective and the bibliography keep their sentence and
+lose only the markup, through `flatten_math`: dropping a heading would cost its
+section the `section_path` and the id built from it. Nothing carrying LaTeX
+markup reaches the normalized file either way.
 
 Two things this stage still owns, because nothing else can:
 
@@ -48,7 +66,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .ir import Document, Source, Chunk, Figure, Passage
+from .ir import Document, Source, Chunk, Figure, Passage, Table
 from . import config
 from . import console
 
@@ -65,8 +83,54 @@ _ATTR_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
 
 # `[FIGURE:p2_b3]` — the marker carried through from the original document.
 FIGURE_MARKER_RE = re.compile(r"\[\s*FIGURE\s*:\s*([^\]\n]+?)\s*\]", re.I)
-# `[[FIG:p2_b3]]` — the rewriter's inline anchor, pointing at a figure block.
-FIG_ANCHOR_RE = re.compile(r"\[\[\s*FIG\s*:\s*([^\]\n]+?)\s*\]\]")
+# `[[FIG:p2_b3]]` / `[[TBL:tbl-2-1]]`, the internal anchor form. Older rewriters
+# wrote `[[FIG:id]]` into the prose directly; the current one wraps the mention
+# in `<figref>`/`<tblref>` and `normalize_inline` rewrites it to this. The
+# surrounding horizontal space is captured too, so `lift_anchors` can tell
+# `(Figure 2-1[[FIG:x]])` from a free-standing ` [[FIG:x]] `.
+_ANCHOR_RE = re.compile(
+    r"(?P<lead>[ \t]*)\[\[\s*(?P<kind>FIG|TBL)\s*:\s*(?P<id>[^\]\n]+?)\s*\]\]"
+    r"(?P<trail>[ \t]*)")
+
+# Inline markup that lives *inside* element content, not between elements.
+# It cannot go through `parse_tagged`: that builds a block tree, and a child
+# node's text is emitted after its parent's, joined by a newline. Running
+# `<sup>` or `<figref>` through it would lift the fragment out of the sentence
+# it belongs to and put it on a line of its own. So these are unwrapped in the
+# raw text first, before the block parse ever sees them.
+_SUPSUB_RE = re.compile(r"</?su[bp]>", re.I)
+_XREF_RE = re.compile(r'<(fig|tbl)ref\b[^>]*\bid="([^"]*)"[^>]*>(.*?)</\1ref>',
+                      re.I | re.S)
+
+# A LaTeX span, which the rewriter leaves inline: `$2.0 \times 10^{-2}$`,
+# `$[OH^{-}]$`, `${ \mathsf { C O } } _ { 2 }$`. Both delimiters are a single
+# `$` and never straddle a line break.
+_MATH_RE = re.compile(r"\$([^$\n]+)\$")
+# Font and grouping commands, which mean nothing once the markup is gone.
+_MATH_FONT_RE = re.compile(
+    r"\\(?:math(?:sf|rm|bf|it|frak|cal|tt)|text(?:sf|rm|bf|it)?"
+    r"|operatorname|left|right)\s*")
+# Commands standing for a character the normalized text can hold directly.
+_MATH_SYMBOLS = {r"\times": "\u00d7", r"\cdot": "\u00b7", r"\pm": "\u00b1",
+                 r"\approx": "\u2248", r"\leq": "\u2264", r"\geq": "\u2265",
+                 r"\rightarrow": "\u2192", r"\to": "\u2192",
+                 r"\Delta": "\u0394", r"\delta": "\u03b4", r"\phi": "\u03c6",
+                 r"\alpha": "\u03b1", r"\beta": "\u03b2", r"\gamma": "\u03b3"}
+_MATH_SYMBOL_RE = re.compile(
+    "(?:" + "|".join(re.escape(name) for name in
+                     sorted(_MATH_SYMBOLS, key=len, reverse=True))
+    + r")(?![A-Za-z])")
+# Whatever command is left is unknown or an OCR artifact — the corpus contains
+# `\ight` where `\right` was scanned. Dropping the command keeps its operands.
+_MATH_COMMAND_RE = re.compile(r"\\[A-Za-z]+\s*|\\(.)")
+# Grouping braces and the script markers. Scripts are flattened by
+# concatenation, the same convention `normalize_inline` applies to `<sup>` and
+# `<sub>`, so `10^{-7}` reads `10-7` and `K_w` reads `Kw`.
+_MATH_MARKUP_RE = re.compile(r"[{}_^]")
+# A sentence boundary: a terminator, then whitespace, then something that can
+# open a sentence. The lookahead excludes a digit so `5. 0` cannot split, and a
+# decimal point is never followed by whitespace, so `2.0 mol/L` stays whole.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[^\s\d])")
 
 _MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+", re.M)
 _BULLET_RE = re.compile(r"^\s*(?:[-+\u2022\u2023\u25aa\u25e6]|\*(?!\*)|\d+[.)])\s+")
@@ -96,6 +160,29 @@ class Node:
         for c in self.children:
             parts.append(c.flat_text())
         return "\n".join(p for p in parts if p.strip()).strip()
+
+
+def normalize_inline(text: str) -> str:
+    """Unwrap inline markup so it survives inside the sentence it belongs to.
+
+    `<sup>`/`<sub>` are dropped and their content joined with *no* separator.
+    The corpus writes `[H<sup>+</sup>]`, `sp<sup>3</sup>`, `pK<sub>a</sub>` and
+    `M<sub>r</sub>`: a space would split a formula into two tokens, and dropping
+    the content would turn H+ into H, a different species. Superscript exponents
+    such as `10<sup>-9</sup>` flatten to `10-9`, which is lossy, but writing
+    `10^-9` would put characters into the text that the source never had.
+
+    `<figref>`/`<tblref>` keep their mention text and gain a trailing
+    `[[FIG:id]]` / `[[TBL:id]]` anchor, which `lift_anchors` strips back off
+    once the text is inside its chunk. Routing through the anchor rather than
+    reading the attribute here is what keeps the id attached to the *chunk* that
+    cited it, which is the only reason the reference is worth having.
+
+    Returns the rewritten text; the input string is untouched.
+    """
+    text = _XREF_RE.sub(
+        lambda m: f"{m.group(3)}[[{m.group(1).upper()}:{m.group(2)}]]", text)
+    return _SUPSUB_RE.sub("", text)
 
 
 def parse_tagged(text: str) -> Node:
@@ -163,7 +250,7 @@ def scan_markers(raw: str) -> list[dict]:
     `[[FIG:id]]` anchors are not markdown and are left alone.
     """
     body = _TAG_RE.sub("", raw)
-    body = FIGURE_MARKER_RE.sub("", FIG_ANCHOR_RE.sub("", body))
+    body = FIGURE_MARKER_RE.sub("", _ANCHOR_RE.sub("", body))
     out = []
     for label, pattern in MARKER_SCANS:
         hits = pattern.findall(body)
@@ -197,6 +284,75 @@ def clean_text(text: str) -> str:
     return "\n".join(out).strip()
 
 
+def _join_math_tokens(tokens: list[str]) -> str:
+    """Rejoin the whitespace-separated pieces of a stripped math span.
+
+    The corpus writes its LaTeX one character per token, `\\mathsf { p } K _ {
+    \\mathsf { a } }`, so most of the whitespace is padding rather than a word
+    break. A gap is kept only where at least one side is more than a single
+    character, which reads `p K a` back as `pKa` while leaving `moles2 per
+    liter2` and `Kw = [H+][OH-]` spaced as written.
+    """
+    out = []
+    for index, token in enumerate(tokens):
+        if index and (len(tokens[index - 1]) > 1 or len(token) > 1):
+            out.append(" ")
+        out.append(token)
+    return "".join(out)
+
+
+def flatten_math(text: str) -> str:
+    """Rewrite every LaTeX span in `text` as the plain characters it denotes.
+
+    Returns the text with each `$...$` replaced; text outside a span is
+    untouched. `$\\mathsf { p } K _ { \\mathsf { a } }$` becomes `pKa` and
+    `$2.0 \\times 10^{-2}$` becomes `2.0 × 10-2`.
+
+    This is what headings, captions and objectives get instead of
+    `drop_formula_sentences`: their math is nearly all notation for a named
+    quantity, and dropping a heading would cost its section the `section_path`
+    and the id built from it. Superscripts and subscripts flatten by
+    concatenation, so an exponent loses its sign convention; that is the same
+    trade `normalize_inline` already makes for `<sup>` and `<sub>`, and it keeps
+    the source's own digits rather than inventing a notation for them.
+    """
+    def render(match: re.Match) -> str:
+        body = _MATH_FONT_RE.sub("", match.group(1))
+        body = _MATH_SYMBOL_RE.sub(lambda m: _MATH_SYMBOLS[m.group(0)], body)
+        body = _MATH_COMMAND_RE.sub(lambda m: m.group(1) or "", body)
+        return _join_math_tokens(_MATH_MARKUP_RE.sub("", body).split())
+
+    return _MATH_RE.sub(render, text)
+
+
+def drop_formula_sentences(text: str) -> str:
+    """Remove every sentence carrying a LaTeX math span.
+
+    Returns the text with the surviving sentences rejoined, line structure
+    intact. A no-op when `config.DROP_FORMULA_SENTENCES` is off.
+
+    The whole sentence goes, not just the span: a formula reaches Stage 2 as one
+    opaque token, and a sentence stripped of the only quantity it was written to
+    carry ("The concentration of hydroxide is .") asserts something the source
+    never said. Lines are preserved because a restated grid is one row per line,
+    and fusing a dropped row's neighbours would invent a claim spanning two
+    rows.
+
+    Headings, captions and objectives go through `flatten_math` instead, which
+    keeps the sentence and rewrites the notation.
+    """
+    if not config.DROP_FORMULA_SENTENCES:
+        return text
+    kept_lines = []
+    for line in text.splitlines():
+        kept = " ".join(s for s in _SENTENCE_SPLIT_RE.split(line)
+                        if not _MATH_RE.search(s))
+        kept = re.sub(r"[ \t]{2,}", " ", kept).strip()
+        if kept:
+            kept_lines.append(kept)
+    return "\n".join(kept_lines)
+
+
 def split_items(node: Node) -> list[str]:
     """Items of a list container, whichever way the rewriter emitted them:
     as child elements (`<pt>`, `<term>`, `<goal>`, `<cit>`) or as `- ` bullets."""
@@ -208,18 +364,29 @@ def split_items(node: Node) -> list[str]:
     return [ln for ln in (clean_text(node.text)).splitlines() if ln.strip()]
 
 
-def lift_anchors(text: str) -> tuple[str, list[str]]:
-    """Pull `[[FIG:id]]` anchors out of prose, returning (text, fig_ids).
+def lift_anchors(text: str) -> tuple[str, list[str], list[str]]:
+    """Pull figure and table anchors out of prose.
 
-    They must not survive into chunk text: Stage 2 requires its `evidence` to be
-    an exact substring of the chunk, and an anchor sitting mid-sentence corrupts
-    every span offset after it. The association is kept on the chunk instead.
+    Returns `(text, fig_ids, tbl_ids)`. The anchors must not survive into chunk
+    text: Stage 2 requires its `evidence` to be an exact substring of the chunk,
+    and an anchor sitting mid-sentence corrupts every span offset after it. The
+    association is kept on the chunk instead.
+
+    An anchor is replaced by a single space only when it had space on *both*
+    sides, which is how a free-standing `[[FIG:id]]` was written. The anchor
+    `normalize_inline` appends sits flush against its mention, so
+    `(Figure 2-1[[FIG:fig-2-1]]).` has to close back up to `(Figure 2-1).`
+    rather than gain a space before the bracket.
     """
-    ids = [m.group(1).strip() for m in FIG_ANCHOR_RE.finditer(text)]
-    cleaned = re.sub(r"[ \t]*" + FIG_ANCHOR_RE.pattern + r"[ \t]*", " ", text)
+    fig_ids, tbl_ids = [], []
+    for m in _ANCHOR_RE.finditer(text):
+        (fig_ids if m.group("kind").upper() == "FIG" else tbl_ids).append(
+            m.group("id").strip())
+    cleaned = _ANCHOR_RE.sub(
+        lambda m: " " if (m.group("lead") and m.group("trail")) else "", text)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip(), ids
+    return cleaned.strip(), fig_ids, tbl_ids
 
 
 def slug(text: str, max_len: int = 48) -> str:
@@ -264,29 +431,77 @@ class _Segment:
     section_path: list[str]
     figure_ref: Optional[str] = None
     figure_refs: list[str] = field(default_factory=list)
+    table_refs: list[str] = field(default_factory=list)
     heading_level: int = 0
     section_id: str = ""
+    # `<fig>`/`<tbl>` this segment's text came out of, so the chunk it becomes
+    # can be bound back to that block once ids are minted.
+    element_id: str = ""
 
 
 # ---------------------------------------------------------------------------
 # Tree -> segments
 # ---------------------------------------------------------------------------
 
-def _walk_section(sec: Node, path: list[str], segs: list[_Segment],
-                  figures: list[Figure], review: list[dict]) -> None:
-    head = sec.find("head")
-    title = clean_text(head.flat_text()) if head else ""
-    sid = sec.attrs.get("id", "")
+def section_level(sec: Node) -> int:
+    """The `level` attribute of a `<sec>`, defaulting to 2 if absent or junk."""
     try:
-        level = int(sec.attrs.get("level") or 2)
+        return int(sec.attrs.get("level") or 2)
     except ValueError:
-        level = 2
+        return 2
+
+
+def nest_sections(sections: list[Node]) -> list[Node]:
+    """Rebuild the section tree from a flat list, using the `level` attribute.
+
+    The rewriter emits sections flat and carries depth in `level`, so a level-2
+    subsection is a *sibling* of the level-1 section it belongs under. Left
+    alone, every section would hang off the document root and `section_path`
+    would lose the parent heading that says what the subsection is a subsection
+    of. Each section is appended to the nearest preceding section of a lower
+    level; anything with no such parent stays at the top.
+
+    Mutates the nodes' `children` in place and returns the new top-level list.
+    A document whose sections are already properly nested (an older rewriter, or
+    one uniform level throughout) comes back unchanged.
+    """
+    top: list[Node] = []
+    stack: list[Node] = []
+    for sec in sections:
+        level = section_level(sec)
+        while stack and section_level(stack[-1]) >= level:
+            stack.pop()
+        if stack:
+            stack[-1].children.append(sec)
+        else:
+            top.append(sec)
+        stack.append(sec)
+    return top
+
+
+def _walk_section(sec: Node, path: list[str], segs: list[_Segment],
+                  figures: list[Figure], tables: list[Table],
+                  review: list[dict]) -> None:
+    head = sec.find("head")
+    raw_title = clean_text(head.flat_text()) if head else ""
+    title = flatten_math(raw_title)
+    sid = sec.attrs.get("id", "")
+    level = section_level(sec)
     here = path + ([title] if title else [])
     # A section with no id of its own still has to be addressable, or its
     # content would fall back into the document-level graph and become
     # unreachable by a section subset. The heading slug is stable enough for
     # that, and `sections()` reports whatever is used either way.
-    sid = sid or slug(title)
+    #
+    # The rewriter derives its own ids the same way, but from the heading with
+    # its markup still in place, so a heading carrying LaTeX or a `<sub>` yields
+    # an id spelled out of the markup: `mathsf-p-mathsf-k-mathsf-a-values-...`,
+    # `p-k-sub-a-sub-values-...`. Its id is kept when the two agree, allowing
+    # for the different length each is truncated at, and re-derived when they
+    # disagree, because the id names a graph.
+    derived = slug(title)
+    if not sid or not (sid.startswith(derived) or derived.startswith(sid)):
+        sid = derived
     if title:
         segs.append(_Segment("heading", title, here, heading_level=level,
                              section_id=sid))
@@ -296,7 +511,7 @@ def _walk_section(sec: Node, path: list[str], segs: list[_Segment],
         if tag == "head":
             continue
         if tag == "sec":
-            _walk_section(child, here, segs, figures, review)
+            _walk_section(child, here, segs, figures, tables, review)
             continue
         if tag == "note":
             if child.attrs.get("status") == "failed" or _FAILED_RE.search(child.flat_text()):
@@ -307,6 +522,9 @@ def _walk_section(sec: Node, path: list[str], segs: list[_Segment],
         if tag == "fig":
             _collect_figure(child, here, segs, figures, review, section_id=sid)
             continue
+        if tag == "tbl":
+            _collect_table(child, here, segs, tables, section_id=sid)
+            continue
 
         kind = TAG_KIND.get(tag)
         if kind is None:
@@ -315,6 +533,7 @@ def _walk_section(sec: Node, path: list[str], segs: list[_Segment],
             body = "\n".join(split_items(child))
         else:
             body = clean_text(child.flat_text())
+        body = drop_formula_sentences(body)
         if not body:
             continue
         # An older rewriter build wrote the failure notice as ordinary <con>
@@ -325,10 +544,10 @@ def _walk_section(sec: Node, path: list[str], segs: list[_Segment],
                            "reason": "section not generated by the rewriter",
                            "planned": body[:300]})
             continue
-        body, anchors = lift_anchors(body)
+        body, fig_anchors, tbl_anchors = lift_anchors(body)
         if body:
-            segs.append(_Segment(kind, body, here, figure_refs=anchors,
-                                 section_id=sid))
+            segs.append(_Segment(kind, body, here, figure_refs=fig_anchors,
+                                 table_refs=tbl_anchors, section_id=sid))
 
 
 def _collect_figure(node: Node, path: list[str], segs: list[_Segment],
@@ -347,8 +566,14 @@ def _collect_figure(node: Node, path: list[str], segs: list[_Segment],
         return
 
     cap_node, desc_node = node.find("cap"), node.find("desc")
-    caption = clean_text(cap_node.flat_text()) if cap_node else ""
-    desc = clean_text(desc_node.flat_text()) if desc_node else ""
+    caption = flatten_math(clean_text(cap_node.flat_text())) if cap_node else ""
+    desc = drop_formula_sentences(
+        clean_text(desc_node.flat_text()) if desc_node else "")
+    # A caption may itself cite another figure ("see Figure 4-4"). The anchor is
+    # dropped rather than kept: `referenced_from` means the prose that sent the
+    # reader to this figure, and one caption pointing at another is not that.
+    caption, _, _ = lift_anchors(caption)
+    desc, desc_figs, desc_tbls = lift_anchors(desc)
 
     segs.append(_Segment("figure_marker", marker or f"[FIGURE:{fid}]", path,
                          figure_ref=fid, section_id=section_id))
@@ -356,23 +581,68 @@ def _collect_figure(node: Node, path: list[str], segs: list[_Segment],
         segs.append(_Segment("caption", caption, path, figure_ref=fid,
                              section_id=section_id))
     if desc:
-        segs.append(_Segment("figure_description", desc, path, figure_ref=fid,
-                             section_id=section_id))
+        # A populated <desc> is not visual prose: it is what a mermaid diagram
+        # or an attached data table became, restated one claim per sentence on
+        # the same contract as body text, so it is chunked rather than parked on
+        # the Figure. Whether Stage 2 then reads it is
+        # `config.EXTRACTABLE_CHUNK_KINDS`, which currently leaves it out.
+        segs.append(_Segment("figure_content", desc, path, figure_ref=fid,
+                             figure_refs=desc_figs, table_refs=desc_tbls,
+                             section_id=section_id, element_id=fid))
 
-    figures.append(Figure(fig_id=fid, image_path="", caption=caption,
-                          referenced_from="", marker=marker or f"[FIGURE:{fid}]",
-                          description=desc, section_id=section_id))
+    figures.append(Figure(fig_id=fid, caption=caption, referenced_from="",
+                          image_path=node.attrs.get("src", "").strip(),
+                          marker=marker or f"[FIGURE:{fid}]",
+                          description=desc, section_id=section_id,
+                          label=node.attrs.get("label", "").strip(),
+                          panel=node.attrs.get("panel", "").strip()))
 
 
-def build_segments(root: Node, review: list[dict]) -> tuple[list[_Segment], list[Figure], Source]:
+def _collect_table(node: Node, path: list[str], segs: list[_Segment],
+                   tables: list[Table], section_id: str = "") -> None:
+    """A `<tbl>` block -> a Table record plus its segments.
+
+    The caption and the restated grid are split rather than flattened together:
+    the `<con>` is assertable text and becomes an extractable chunk, while the
+    `<cap>` only names the table ("Bond Energies for Atoms of Biologic
+    Significance") and would contribute a subject-less fragment to the middle of
+    it. A table with no id is still worth its content, so it keeps the chunk and
+    loses only its `<tblref>` addressability.
+    """
+    tid = node.attrs.get("id", "").strip()
+    cap_node = node.find("cap")
+    caption = flatten_math(clean_text(cap_node.flat_text())) if cap_node else ""
+    caption, _, _ = lift_anchors(caption)
+    body = "\n".join(clean_text(c.flat_text()) for c in node.findall("con"))
+    body = drop_formula_sentences(body)
+    body = "\n".join(ln for ln in body.splitlines() if ln.strip())
+
+    if caption:
+        segs.append(_Segment("table_caption", caption, path,
+                             section_id=section_id, element_id=tid))
+    if body:
+        body, fig_anchors, tbl_anchors = lift_anchors(body)
+        segs.append(_Segment("table", body, path, figure_refs=fig_anchors,
+                             table_refs=tbl_anchors, section_id=section_id,
+                             element_id=tid))
+    if tid:
+        tables.append(Table(table_id=tid, caption=caption,
+                            label=node.attrs.get("label", "").strip(),
+                            section_id=section_id))
+
+
+def build_segments(root: Node, review: list[dict]
+                   ) -> tuple[list[_Segment], list[Figure], list[Table],
+                              Source]:
     segs: list[_Segment] = []
     figures: list[Figure] = []
+    tables: list[Table] = []
 
     meta = root.find("meta")
-    title = origin = generator = generated = topic = ""
+    title = origin = generator = generated = topic = book = ""
     if meta:
         t = meta.find("title")
-        title = clean_text(t.flat_text()) if t else ""
+        title = flatten_math(clean_text(t.flat_text())) if t else ""
         tp = meta.find("topic")
         topic = clean_text(tp.flat_text()) if tp else ""
         sn = meta.find("src")
@@ -381,32 +651,44 @@ def build_segments(root: Node, review: list[dict]) -> tuple[list[_Segment], list
             origin = info.get("source", "")
             generator = info.get("model", "")
             generated = info.get("generated", "")
+            book = info.get("book", "")
 
     if title:
         segs.append(_Segment("heading", title, [], heading_level=1))
 
     obj = root.find("obj")
     if obj:
-        items = "\n".join(split_items(obj))
+        items = flatten_math("\n".join(split_items(obj)))
         if items:
             segs.append(_Segment("objective", items, [title] if title else []))
 
-    for sec in root.findall("sec"):
-        _walk_section(sec, [title] if title else [], segs, figures, review)
+    for sec in nest_sections(root.findall("sec")):
+        _walk_section(sec, [title] if title else [], segs, figures, tables,
+                      review)
 
-    for tag in ("sum", "ref"):
+    # `<def>` moved from inside a section to the foot of the document, where the
+    # rewriter now puts the chapter glossary. Walking only the sections would
+    # drop it silently, and a glossary is the densest definition text in the
+    # document.
+    for tag in ("sum", "def", "ref"):
         node = root.find(tag)
         if not node:
             continue
-        body = "\n".join(split_items(node)) if tag in LIST_TAGS else clean_text(node.flat_text())
+        body = ("\n".join(split_items(node)) if tag in LIST_TAGS
+                else clean_text(node.flat_text()))
+        # `<ref>` is a passage and never reaches the extractor, so a citation
+        # that happens to carry math keeps its sentence and only loses the
+        # markup.
+        body = (flatten_math(body) if tag == "ref"
+                else drop_formula_sentences(body))
         if body:
             segs.append(_Segment(TAG_KIND[tag], body, [title] if title else []))
 
     stem = os.path.splitext(os.path.basename(origin))[0] if origin else ""
     source = Source(source_id=stem or "document", title=title or stem or "Document",
                     section=topic, origin=origin, generator=generator,
-                    generated_at=generated)
-    return segs, figures, source
+                    generated_at=generated, edition=book)
+    return segs, figures, tables, source
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +723,9 @@ def _merge(segs: list[_Segment], max_chars: int) -> list[list[_Segment]]:
         if (prev and s.kind == prev.kind and s.kind in config.CHUNK_KINDS
                 and prev.section_path == s.section_path
                 and prev.section_id == s.section_id
+                # Two tables in one section restate two different grids; merging
+                # them would produce a chunk that no single <tblref> points at.
+                and prev.element_id == s.element_id
                 and sum(len(x.text) + 2 for x in groups[-1]) + len(s.text) <= max_chars):
             groups[-1].append(s)
         else:
@@ -450,11 +735,16 @@ def _merge(segs: list[_Segment], max_chars: int) -> list[list[_Segment]]:
 
 def assemble(segs: list[_Segment], review: Optional[list] = None,
              max_chars: int = None):
-    """Segments -> (normalized text, chunks, passages, figure spans).
+    """Segments -> (text, chunks, passages, figure spans, table spans, blocks).
 
     Everything is written to the normalized file and every piece gets a span,
     but only assertable text becomes a `Chunk`. Guarantees
     `normalized[start:end] == text` for chunks, passages and figure spans alike.
+
+    `fig_spans` maps a figure id to its caption/description spans and
+    `tbl_spans` a table id to its caption span. `blocks` is
+    `{element_id: chunk_id}` for the `<fig>`/`<tbl>` blocks whose own content
+    became a chunk, which binds a table to the sentences its grid became.
     """
     limit = config.MAX_CHUNK_CHARS if max_chars is None else max_chars
     rev = review if review is not None else []
@@ -462,6 +752,8 @@ def assemble(segs: list[_Segment], review: Optional[list] = None,
     chunks: list[Chunk] = []
     passages: list[Passage] = []
     fig_spans: dict[str, dict[str, list[int]]] = {}
+    tbl_spans: dict[str, list[int]] = {}
+    blocks: dict[str, str] = {}
     counter = itertools.count(1)
     pcounter = itertools.count(1)
     seen: dict[str, str] = {}
@@ -478,6 +770,12 @@ def assemble(segs: list[_Segment], review: Optional[list] = None,
         if head.kind in ("caption", "figure_description"):
             slot = "caption" if head.kind == "caption" else "description"
             fig_spans.setdefault(head.figure_ref or "", {})[slot] = [start, end]
+            continue
+        if head.kind == "table_caption":
+            # A caption names its table without asserting anything about it, so
+            # it is written and positioned but never extracted, the same way a
+            # figure caption is.
+            tbl_spans[head.element_id] = [start, end]
             continue
         if head.kind in config.PASSAGE_KINDS:
             passages.append(Passage(
@@ -498,24 +796,37 @@ def assemble(segs: list[_Segment], review: Optional[list] = None,
             kind = "duplicate"
         cid = f"c{next(counter):03d}"
         seen.setdefault(key, cid)
+        if head.element_id:
+            blocks.setdefault(head.element_id, cid)
         chunks.append(Chunk(
             chunk_id=cid, text=text, char_start=start, char_end=end,
             section_path=list(head.section_path), kind=kind,
             figure_refs=sorted({r for s in group for r in s.figure_refs}),
+            table_refs=sorted({r for s in group for r in s.table_refs}),
             section_id=head.section_id,
         ))
-    return w.value(), chunks, passages, fig_spans
+    return w.value(), chunks, passages, fig_spans, tbl_spans, blocks
 
 
 def _bind_figures(figures: list[Figure], chunks: list[Chunk], fig_spans: dict,
-                  figures_dir: str, figures_ext: str, verify_images: bool,
-                  review: list[dict]) -> None:
+                  blocks: dict, figures_dir: str, figures_ext: str,
+                  verify_images: bool, review: list[dict]) -> None:
+    """Attach spans, the citing chunk, the content chunk and the image path.
+
+    `blocks` maps a `<fig>`/`<tbl>` id to the chunk its own content became,
+    which is how a populated `<desc>` gets back to the figure it describes.
+    Mutates the `Figure` objects and appends to `review`; returns nothing.
+    """
     by_id = {f.fig_id: f for f in figures}
     for fid, spans in fig_spans.items():
         fig = by_id.get(fid)
         if fig is not None:
             fig.caption_span = spans.get("caption")
             fig.description_span = spans.get("description")
+    for fid, cid in blocks.items():
+        fig = by_id.get(fid)
+        if fig is not None:
+            fig.content_chunk = cid
     for c in chunks:
         # `referenced_from` is the prose that ACTUALLY points at the figure, via
         # a [[FIG:id]] anchor -- never the figure's own caption, which would make
@@ -532,15 +843,56 @@ def _bind_figures(figures: list[Figure], chunks: list[Chunk], fig_spans: dict,
             review.append({"stage": "stage1-figure", "fig_id": fig.fig_id,
                            "reason": "figure never anchored in prose"})
     for fig in figures:
-        path = fig.fig_id
+        # The image path comes from the `<fig src="...">` the rewriter carried
+        # over from the original document. It is a content-hash filename, so it
+        # cannot be derived from `fig_id`; `figures_ext` only ever applies to a
+        # src that arrived without a suffix, and `figures_dir` relocates a
+        # relative src to wherever the image tree actually sits.
+        path = fig.image_path
+        if not path:
+            review.append({"stage": "stage1-figure", "fig_id": fig.fig_id,
+                           "reason": "figure has no src image"})
+            continue
         if figures_ext and not os.path.splitext(path)[1]:
             path += figures_ext if figures_ext.startswith(".") else "." + figures_ext
         if figures_dir and not os.path.isabs(path):
             path = os.path.join(figures_dir, path)
-        fig.image_path = path if (figures_dir or figures_ext) else ""
-        if verify_images and fig.image_path and not os.path.exists(fig.image_path):
+        fig.image_path = path
+        if verify_images and not os.path.exists(fig.image_path):
             review.append({"stage": "stage1-figure", "fig_id": fig.fig_id,
                            "reason": "image file not found", "path": fig.image_path})
+
+
+def _bind_tables(tables: list[Table], chunks: list[Chunk], tbl_spans: dict,
+                 blocks: dict, review: list[dict]) -> None:
+    """Attach each table's caption span, content chunk and citing chunk.
+
+    `tbl_spans` is `{table_id: [start, end]}` for captions and `blocks` is
+    `{element_id: chunk_id}` from `assemble`. A table whose grid produced no
+    chunk, or that no prose cites, is flagged for review rather than dropped.
+    Mutates the `Table` objects; returns nothing.
+    """
+    by_id = {t.table_id: t for t in tables}
+    for tid, span in tbl_spans.items():
+        table = by_id.get(tid)
+        if table is not None:
+            table.caption_span = span
+    for tid, cid in blocks.items():
+        table = by_id.get(tid)
+        if table is not None:
+            table.content_chunk = cid
+    for c in chunks:
+        for ref in c.table_refs:
+            target = by_id.get(ref)
+            if target is not None and not target.referenced_from:
+                target.referenced_from = c.chunk_id
+    for table in tables:
+        if not table.content_chunk:
+            review.append({"stage": "stage1-table", "table_id": table.table_id,
+                           "reason": "table has no restated content"})
+        if not table.referenced_from:
+            review.append({"stage": "stage1-table", "table_id": table.table_id,
+                           "reason": "table never cited in prose"})
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +918,11 @@ def parse_file(md_path: str, *, normalized_path: str = None, doc_id: str = None,
     normalized_path = normalized_path or config.artifact_path(
         stem + ".normalized.md")
 
+    # Inline markup is unwrapped before anything else looks at the text, not
+    # during the block parse: `parse_tagged` would lift a `<figref>` out of the
+    # sentence it sits in, and `scan_markers` would read the wrapper as content.
+    raw = normalize_inline(raw)
+
     console.announce_step("scanning for rewriter markers and failed sections")
     review: list[dict] = scan_markers(raw)
     console.announce_detail(console.format_count(len(review), "marker")
@@ -573,14 +930,16 @@ def parse_file(md_path: str, *, normalized_path: str = None, doc_id: str = None,
 
     console.announce_step("parsing tags into sections, figures and segments")
     root = parse_tagged(raw)
-    segs, figures, parsed_source = build_segments(root, review)
+    segs, figures, tables, parsed_source = build_segments(root, review)
     console.announce_detail(f"{console.format_count(len(segs), 'segment')}, "
-                            f"{console.format_count(len(figures), 'figure')}")
+                            f"{console.format_count(len(figures), 'figure')}, "
+                            f"{console.format_count(len(tables), 'table')}")
 
     console.announce_step(
         f"assembling chunks (same-kind runs merge up to "
         f"{config.MAX_CHUNK_CHARS:,} characters)")
-    normalized, chunks, passages, fig_spans = assemble(segs, review)
+    normalized, chunks, passages, fig_spans, tbl_spans, blocks = assemble(
+        segs, review)
     kind_counts: dict[str, int] = {}
     for chunk in chunks:
         kind_counts[chunk.kind] = kind_counts.get(chunk.kind, 0) + 1
@@ -597,9 +956,14 @@ def parse_file(md_path: str, *, normalized_path: str = None, doc_id: str = None,
         + ", ".join(f"{kind} {count}"
                     for kind, count in sorted(passage_counts.items())))
 
-    console.announce_step("binding figure markers to their chunks")
-    _bind_figures(figures, chunks, fig_spans, figures_dir, figures_ext,
+    console.announce_step("binding figures and tables to their chunks")
+    _bind_figures(figures, chunks, fig_spans, blocks, figures_dir, figures_ext,
                   verify_images, review)
+    _bind_tables(tables, chunks, tbl_spans, blocks, review)
+    console.announce_detail(
+        f"{sum(1 for f in figures if f.referenced_from)}/{len(figures)} "
+        f"figures and {sum(1 for t in tables if t.referenced_from)}/"
+        f"{len(tables)} tables cited from prose")
 
     console.announce_step(f"writing normalized text -> {normalized_path}")
     with open(normalized_path, "w", encoding="utf-8") as fh:
@@ -610,7 +974,7 @@ def parse_file(md_path: str, *, normalized_path: str = None, doc_id: str = None,
         src.source_id = stem
     doc = Document(
         doc_id=doc_id or src.source_id, source=src, chunks=chunks, figures=figures,
-        passages=passages, needs_review=review,
+        tables=tables, passages=passages, needs_review=review,
         source_path=os.path.abspath(md_path),
         normalized_path=os.path.abspath(normalized_path),
     )
@@ -623,6 +987,10 @@ def parse_file(md_path: str, *, normalized_path: str = None, doc_id: str = None,
             if span:
                 assert normalized[span[0]:span[1]] == text, \
                     f"offset drift in figure {fig.fig_id}"
+    for table in doc.tables:
+        if table.caption_span:
+            assert normalized[table.caption_span[0]:table.caption_span[1]] \
+                == table.caption, f"offset drift in table {table.table_id}"
     console.announce_finished(
         "stage 1", started_at,
         f"{src.source_id}, "

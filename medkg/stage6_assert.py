@@ -69,6 +69,77 @@ def graph_for(source_id: str, section_id: str = "") -> str:
     return f"{base}/{section_id}" if section_id else base
 
 
+def chunk_uri(source_id: str, chunk_id: str) -> str:
+    """The node standing for one chunk of normalized text.
+
+    Scoped by `source_id` because chunk ids restart at `c001` in every document,
+    so the bare id collides the moment two chapters share a store.
+    """
+    return f"{config.INST}chunk/{source_id}/{chunk_id}"
+
+
+def table_uri(source_id: str, table_id: str) -> str:
+    """The node standing for a `<tbl>` block, scoped the same way as a chunk."""
+    return f"{config.INST}tbl/{source_id}/{table_id}"
+
+
+def build_table_quads(doc: Document, graph: str, tables=None) -> list[tuple]:
+    """(s, p, o, g) for every table: the node, its label and caption, and edges
+    to the chunk holding its restated grid and to the prose that cites it.
+
+    The grid's sentences are not repeated here. They are an ordinary chunk and
+    Stage 2 extracts relations from them like any other, so the table node's job
+    is to say which chunk that is, not to carry the text a second time.
+
+    `tables` narrows the set so Stage 6 can call this once per section graph.
+    """
+    sid = doc.source.source_id
+    quads: list[tuple] = []
+    for tbl in (doc.tables if tables is None else tables):
+        node = table_uri(sid, tbl.table_id)
+        quads.append((node, config.RDF_TYPE, config.TABLE_BLOCK, graph))
+        if tbl.label:
+            quads.append((node, config.RDFS_LABEL, Lit(tbl.label), graph))
+            quads.append((node, config.TABLE_LABEL, Lit(tbl.label), graph))
+        if tbl.caption:
+            quads.append((node, config.CAPTION, Lit(tbl.caption), graph))
+        if tbl.content_chunk:
+            quads.append((node, config.TABLE_CONTENT,
+                          chunk_uri(sid, tbl.content_chunk), graph))
+        if tbl.referenced_from:
+            quads.append((node, config.TABLE_REF,
+                          chunk_uri(sid, tbl.referenced_from), graph))
+    return quads
+
+
+def build_chunk_quads(doc: Document, chunk_ids, graph_of_chunk) -> list[tuple]:
+    """Declare the chunk nodes that figure and table edges point at.
+
+    Only the cited chunks are minted, not every chunk in the document: a chunk
+    node exists so a figure reference can be an edge into the text rather than
+    an id stranded in a literal, and one that nothing points at would be a node
+    with no incoming edge and no query that reaches it. Each carries its kind
+    and offsets into `Document.normalized_path`, enough to fetch the text.
+
+    `chunk_ids` is the set to declare and `graph_of_chunk` maps a chunk id to
+    the named graph it belongs in.
+    """
+    sid = doc.source.source_id
+    quads: list[tuple] = []
+    for chunk in doc.chunks:
+        if chunk.chunk_id not in chunk_ids:
+            continue
+        node = chunk_uri(sid, chunk.chunk_id)
+        g = graph_of_chunk(chunk.chunk_id)
+        quads += [
+            (node, config.RDF_TYPE, config.CHUNK_NODE, g),
+            (node, config.CHUNK_KIND, Lit(chunk.kind), g),
+            (node, config.CHAR_START, Lit(chunk.char_start), g),
+            (node, config.CHAR_END, Lit(chunk.char_end), g),
+        ]
+    return quads
+
+
 def build_quads(doc: Document, snomed_version: str = config.SNOMED_VERSION):
     """Return (quads, annotations) for ONE document. Pure stdlib.
 
@@ -156,6 +227,26 @@ def build_quads(doc: Document, snomed_version: str = config.SNOMED_VERSION):
     for section_id, figs in by_section.items():
         quads += stage5_images.build_depicts_quads(
             doc, graph_for(doc.source.source_id, section_id), figures=figs)
+
+    # --- table nodes -------------------------------------------------------
+    # Same treatment as figures, and for the same reason: a table declared in a
+    # section belongs to that section's graph, not to the document's.
+    tables_by_section: dict[str, list] = {}
+    for tbl in doc.tables:
+        tables_by_section.setdefault(tbl.section_id, []).append(tbl)
+    for section_id, tbls in tables_by_section.items():
+        quads += build_table_quads(
+            doc, graph_for(doc.source.source_id, section_id), tables=tbls)
+
+    # --- chunk nodes the figure and table edges land on --------------------
+    cited_chunks = {cid for fig in doc.figures
+                    for cid in (fig.referenced_from, fig.content_chunk) if cid}
+    cited_chunks |= {cid for tbl in doc.tables
+                     for cid in (tbl.referenced_from, tbl.content_chunk) if cid}
+    quads += build_chunk_quads(
+        doc, cited_chunks,
+        lambda cid: graph_for(doc.source.source_id,
+                              section_of_chunk.get(cid, "")))
 
     # --- provenance: asserted ONCE about the whole graph -------------------
     # Stage 1's input is a REWRITTEN document, not the original material, so the

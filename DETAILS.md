@@ -83,9 +83,13 @@ These are enforced across stages and explain most of the design decisions below.
 1. **Offsets are the contract.** Stage 1 writes a tag-free normalized rendering
    and asserts `normalized[chunk.char_start:chunk.char_end] == chunk.text` for
    every chunk. Every later stage's grounding check depends on that holding.
-2. **Figure prose never becomes a clinical fact.** Captions and figure
-   descriptions are routed away from relation extraction. A figure that *shows*
-   pericarditis has diagnosed no one.
+2. **Captions never become clinical facts.** A `<cap>` names its figure or
+   table without asserting anything, so it is routed away from relation
+   extraction and reaches the graph only as a depiction. A figure that *shows*
+   pericarditis has diagnosed no one. A populated `<desc>` is the exception,
+   and only because it is not visual prose: it holds the sentences a mermaid
+   diagram or an attached data table was restated into, on the same
+   one-claim-per-sentence contract as body text.
 3. **Deterministic URIs.** Instance and assertion node ids are hashes of stable
    inputs, so re-running the pipeline on unchanged input produces byte-identical
    node identities rather than a second parallel graph.
@@ -145,19 +149,62 @@ strip of tissue called the isthmus. [[FIG:p5_b2]]
 ```
 
 Chunk kinds are `prose`, `definition`, `keypoint`, `clinical`, `summary`,
-`caption`, `figure_description` and `duplicate`. Only the first five reach
-Stage 2.
+`table`, `figure_content` and `duplicate`. `config.EXTRACTABLE_CHUNK_KINDS`
+decides which of them Stage 2 reads; `duplicate` never does, and
+`figure_content` currently does not either (see below). `caption` and
+`table_caption` are written to the normalized file and carry spans, but become
+`Figure.caption_span` / `Table.caption_span` rather than chunks.
 
 ### Design decisions
 
-**`chunks` holds only extractable body text.** Captions and figure descriptions
-live on `Figure`; objectives, tables and bibliography live on `Document.passages`.
-Chunks used to hold captions as well as storing them on `Figure`, which was pure
+**`chunks` holds only extractable body text.** Captions live on `Figure` and
+`Table`; objectives and bibliography live on `Document.passages`. Chunks used
+to hold captions as well as storing them on `Figure`, which was pure
 duplication and cost 27% of chunk text even on the small sample. But the
-non-extractable material is *moved*, not deleted — everything is still written to
-the normalized file and still carries a span, so a depiction edge can point at
-where its caption sits. Deleting source material to tidy a data structure is not
-a trade worth making.
+non-extractable material is *moved*, not deleted: everything is still written
+to the normalized file and still carries a span, so a depiction edge can point
+at where its caption sits. Deleting source material to tidy a data structure is
+not a trade worth making.
+
+**A restated grid is body text.** The rewriter turns a table's rows into
+standalone sentences that each name their own row and column, so `<tbl>`'s
+`<con>` is assertable by exactly the same argument as `<con>` anywhere else and
+is chunked like it. The `<tbl>` block keeps what a chunk cannot carry: the
+`<tblref>` target id, the printed label, and the caption. The same reasoning
+promotes a populated `<desc>` to a `figure_content` chunk.
+
+**Figure text is chunked but not extracted.** `figure_content` is deliberately
+absent from `config.EXTRACTABLE_CHUNK_KINDS`, and `BRIDGE_FIGURE_CAPTIONS` is
+off, so no figure text reaches Stage 2 or Stage 5's linker. The current corpus
+attaches some `<desc>` blocks to the wrong `<fig>`, which would assert a claim
+about a picture that does not show it, and most figures carry no `src` to depict
+anything with. Nothing is thrown away: the chunk, the caption, the label and the
+`ont:figureRef` edge are all still built, so both switches restore the previous
+behaviour on their own.
+
+**A formula is not extractable text.** `drop_formula_sentences` removes any
+sentence carrying a LaTeX span from body prose, a restated grid and a `<desc>`
+before it becomes a chunk. The extractor sees a formula as one opaque token, so
+the relation it produces has an unusable object, and stripping the span alone
+would leave a sentence asserting something the source never said.
+`config.DROP_FORMULA_SENTENCES` turns the filter off.
+
+**A heading keeps its formula, without the markup.** Dropping a heading would
+cost its section the `section_path` and the id built from it, so headings,
+captions, learning objectives and the bibliography go through `flatten_math`
+instead: each `$...$` span is rewritten as the plain characters it denotes, so
+`$\mathsf { p } K _ { \mathsf { a } }$ Values Depend on the Properties of the
+Medium` reads `pKa Values Depend on the Properties of the Medium`. Scripts
+flatten by concatenation, the convention `normalize_inline` already applies to
+`<sup>` and `<sub>`.
+
+Section ids are re-derived when this changes the heading. The rewriter slugs the
+heading as it wrote it, markup included, so a heading carrying LaTeX or a
+`<sub>` produced an id like `mathsf-p-mathsf-k-mathsf-a-values-depend-on-the-`
+`properties` or `p-k-sub-a-sub-values-vary-with-the-environment`. That id names
+a graph. Stage 1 keeps the rewriter's id where it agrees with a slug of the
+flattened heading and replaces it where it does not, which on the current corpus
+is three sections out of 63.
 
 **Provenance is separated from the source.** The document being parsed was
 written by a model. `<src>` records what the rewriter was given and which model
@@ -531,6 +578,12 @@ caption text Stage 1 routed away from relation extraction.
 **Output.** `Depiction` records, which Stage 6 turns into `ont:depicts` edges,
 with `ont:caption` and `ont:visualDescription` literals on the figure node.
 
+**Currently off.** `config.BRIDGE_FIGURE_CAPTIONS` is `False`, so this stage
+returns immediately and no `depicts` edge is produced for the present corpus.
+The figure nodes themselves are Stage 6's work, not this stage's, so they and
+their captions, labels and `ont:figureRef` edges are unaffected. The rest of
+this section describes what runs when the switch is on.
+
 Figure text is run through the same NER and the same linker (both injected, so
 nothing heavy is imported at module scope). Two rules make this safe:
 
@@ -538,9 +591,13 @@ nothing heavy is imported at module scope). Two rules make this safe:
 cannot head a relation, cannot mint an instance, and are never asserted as fact.
 
 **Caption over description.** Depiction edges are restricted to the caption,
-which carries the medicine. The visual description — "a gradient of light blue",
-"a leader line points to" — is kept as a literal for retrieval and provenance
-rather than linked. Negated caption mentions depict nothing.
+which carries the medicine. A `<desc>` that is genuinely visual, "a gradient of
+light blue" or "a leader line points to", is kept as an `ont:visualDescription`
+literal for retrieval and provenance rather than linked. Under the current tag
+schema `<desc>` instead holds a restated diagram or data table, which becomes a
+`figure_content` chunk and is reached from the figure node by
+`ont:figureContent`; the literal is then dropped rather than stored twice.
+Negated caption mentions depict nothing.
 
 This firewall is testable and has been observed holding: a rewriter hallucination
 in one figure description ("MIT (monochloride)" for monoiodotyrosine) never

@@ -319,10 +319,10 @@ def main():
                          "is already on disk and newer than its input")
     ap.add_argument("--index-dir", default="./umls_index")
     ap.add_argument("--figures-dir", default="",
-                    help="prefix prepended to relative [FIGURE:...] references")
+                    help="prefix prepended to a relative <fig src=...> path")
     ap.add_argument("--figures-ext", default="",
-                    help="extension appended to extensionless [FIGURE:...] refs, "
-                         "e.g. .png -- turns the id 'p2_b3' into a locator")
+                    help="extension appended to a src that arrived "
+                         "without one, e.g. .png")
     ap.add_argument("--verify-figures", action="store_true",
                     help="check that each resolved image path exists (off by default: "
                          "parsing stays a pure function of the document)")

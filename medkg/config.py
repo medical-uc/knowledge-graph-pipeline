@@ -186,23 +186,68 @@ CAPTION            = ONT + "caption"
 VISUAL_DESCRIPTION = ONT + "visualDescription"
 FIGURE_IMAGE       = ONT + "FigureImage"
 FIGURE_REF         = ONT + "figureRef"
+FIGURE_LABEL       = ONT + "figureLabel"
+FIGURE_PANEL       = ONT + "figurePanel"
+# The chunk a figure's own restated content became, as an edge rather than the
+# bare literal `figureRef` carries, so a query can walk from a figure into the
+# text of the claims it illustrates.
+FIGURE_CONTENT     = ONT + "figureContent"
+
+# --- Stage 1/6: table vocabulary --------------------------------------------
+TABLE_BLOCK        = ONT + "Table"
+TABLE_REF          = ONT + "tableRef"
+TABLE_LABEL        = ONT + "tableLabel"
+TABLE_CONTENT      = ONT + "tableContent"
+
+# --- Stage 6: chunk nodes ---------------------------------------------------
+# Only the chunks a figure or table points at are minted as nodes, so a figure
+# reference is an edge into the text rather than a chunk id stranded in a
+# literal. Offsets index the file named by `Document.normalized_path`.
+CHUNK_NODE         = ONT + "Chunk"
+CHUNK_KIND         = ONT + "chunkKind"
+CHAR_START         = ONT + "charStart"
+CHAR_END           = ONT + "charEnd"
 
 # --- Stage 1: markdown parsing ----------------------------------------------
-# Chunk kinds. Only EXTRACTABLE_CHUNK_KINDS reach Stage 2; captions and figure
-# descriptions are routed to Stage 5 so image prose never becomes a clinical fact.
+# Chunk kinds. Only EXTRACTABLE_CHUNK_KINDS reach Stage 2; captions are routed
+# to Stage 5, so text that merely names an image never becomes a clinical fact.
 # Stage 1's input is the tagged document the rewriter emits, so chunk kinds map
 # straight onto its tags rather than being inferred.
 #   prose <con>   definition <def>   keypoint <key>   clinical <clin>
-#   summary <sum> caption <cap>      figure_description <desc>
-#   table <tbl>   reference <ref>    objective <obj>  duplicate (deduped)
-# A chunk is assertable text, full stop. Figure captions and descriptions live on
-# `Figure` (storing them twice bought nothing — no stage read the chunk copies);
-# objectives, tables and bibliography live in `Document.passages`.
-CHUNK_KINDS = ("prose", "definition", "keypoint", "clinical", "summary", "duplicate")
-PASSAGE_KINDS = ("objective", "table", "reference")
+#   summary <sum> caption <cap>      figure_content <desc>
+#   table <tbl><con>                 table_caption <tbl><cap>
+#   reference <ref>                  objective <obj>  duplicate (deduped)
+# `table` and `figure_content` are chunks because the rewriter restates a grid
+# and a diagram as standalone sentences on the same one-claim-per-sentence
+# contract as body prose, so they are assertable by construction. A `<cap>` is
+# not: it names its figure or table without asserting anything, and lives on
+# `Figure`/`Table` instead. Objectives and bibliography live in
+# `Document.passages`.
+CHUNK_KINDS = ("prose", "definition", "keypoint", "clinical", "summary",
+               "table", "figure_content", "duplicate")
+PASSAGE_KINDS = ("objective", "reference")
 # Which chunk kinds Stage 2 reads. Everything but `duplicate` by default; narrow
 # it to drop e.g. the closing <sum> without re-running Stage 1.
-EXTRACTABLE_CHUNK_KINDS = ("prose", "definition", "keypoint", "clinical", "summary")
+# `figure_content` is a chunk but not currently extractable: the descriptions
+# the rewriter attached to figures are in places mismatched to the figure they
+# sit in, so the claims they carry would be asserted about the wrong picture.
+# Adding it back here is the only step needed to turn figure extraction on.
+EXTRACTABLE_CHUNK_KINDS = ("prose", "definition", "keypoint", "clinical",
+                           "summary", "table")
+
+# Whether Stage 5 turns figure captions into `ont:depicts` edges. Off for the
+# same reason, and because most figures in the corpus carry no `src` to depict
+# anything with. Figures are still parsed, kept in the IR and asserted as nodes;
+# only the linking of their text is skipped.
+BRIDGE_FIGURE_CAPTIONS = os.environ.get("MEDKG_BRIDGE_FIGURES", "0") == "1"
+
+# Whether a sentence carrying a LaTeX math span survives into a chunk. The
+# rewriter leaves `$2.0 \times 10^{-2}$` and `$[OH^{-}]$` inline, and a formula
+# reaches the extractor as one opaque token, so the sentence yields a relation
+# whose object is unusable. Dropping the whole sentence rather than the span
+# alone is deliberate: a sentence stripped of its only quantity asserts
+# something the source never said.
+DROP_FORMULA_SENTENCES = os.environ.get("MEDKG_KEEP_FORMULAS", "0") != "1"
 
 
 # --- Thresholds -------------------------------------------------------------

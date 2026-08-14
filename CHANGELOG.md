@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stage1_parse.normalize_inline` unwraps the inline markup the current
+  rewriter emits (`<figref>`, `<tblref>`, `<sup>`, `<sub>`) before the block
+  parse runs. These tags sit inside a sentence rather than between elements, so
+  routing them through `parse_tagged` would lift the fragment onto a line of its
+  own and reorder it after its parent's text. `<sup>`/`<sub>` content is joined
+  with no separator, so `pK<sub>a</sub>` stays `pKa` and `[H<sup>+</sup>]` stays
+  `[H+]` rather than losing the species.
+- Figure references work again. A `<figref>` becomes a `[[FIG:id]]` anchor that
+  `lift_anchors` moves onto the citing chunk, so `Figure.referenced_from` binds
+  to the prose that actually sent the reader to the figure. Anchors are stripped
+  from chunk text, so the exact-offset invariant Stage 2's grounding depends on
+  still holds.
+- `ir.Table` and `Document.tables`, with `table_by_id()`. A `<tbl>` keeps what a
+  chunk cannot carry: its `<tblref>` target id, its printed label, its caption
+  and the chunk holding its restated grid.
+- `Chunk.table_refs`, the `<tblref>` counterpart to `figure_refs`.
+- `Figure.label`, `Figure.panel` and `Figure.content_chunk`, from the `label`,
+  `panel` and `<desc>` the rewriter now emits.
+- `stage1_parse.nest_sections` rebuilds the section tree from the `level`
+  attribute. The rewriter emits sections flat, so without this every subsection
+  hung off the document root and `section_path` lost the parent heading.
+- `stage6_assert.build_table_quads`, `build_chunk_quads`, `table_uri` and
+  `chunk_uri`. Table nodes are asserted per section alongside figures, and the
+  chunks a figure or table points at are minted as typed nodes carrying their
+  kind and offsets, so a reference is an edge into the text rather than a chunk
+  id stranded in a literal.
+- `ont:figureLabel`, `ont:figurePanel`, `ont:figureContent`, `ont:Table`,
+  `ont:tableRef`, `ont:tableLabel`, `ont:tableContent`, `ont:Chunk`,
+  `ont:chunkKind`, `ont:charStart` and `ont:charEnd`.
 - Span labels are now re-derived from the UMLS semantic type of the concept a
   mention linked to, instead of being taken on trust from the NER model that
   tagged it. `build_index.py --mrsty MRSTY.RRF` writes a `semantic_types.json`
@@ -86,6 +115,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused rather than merged. The id names the graph and seeds the Stage-4
   instance hashes, so a collision silently mints one document's instance nodes
   onto another's.
+- `stage1_parse.drop_formula_sentences` removes any sentence carrying a LaTeX
+  span from body prose, a restated grid, a `<desc>`, the closing summary and the
+  glossary before it becomes a chunk. A formula reaches the extractor as one
+  opaque token, so the relation it yields has an unusable object, and stripping
+  the span alone would leave a sentence asserting something the source never
+  said. `config.DROP_FORMULA_SENTENCES` turns it off.
+- `stage1_parse.flatten_math` rewrites a LaTeX span as the plain characters it
+  denotes, so `$\mathsf { p } K _ { \mathsf { a } }$` reads `pKa` and
+  `$2.0 \times 10^{-2}$` reads `2.0 × 10-2`. Headings, captions, learning
+  objectives and the bibliography go through this rather than
+  `drop_formula_sentences`: dropping a heading would cost its section the
+  `section_path` and the id built from it. Scripts flatten by concatenation,
+  the convention `normalize_inline` already applies to `<sup>` and `<sub>`.
+- `config.BRIDGE_FIGURE_CAPTIONS`, which gates Stage 5's caption-to-depiction
+  bridge, and honoured by `stage5_images.bridge_figures` as an early return.
+
+### Changed
+
+- A table's restated grid is now an extractable chunk. `table` moves out of
+  `PASSAGE_KINDS` into `CHUNK_KINDS` and `EXTRACTABLE_CHUNK_KINDS`, and a
+  `<tbl>`'s `<cap>` is split off rather than flattened into the body. The
+  rewriter states each row as a standalone sentence naming its own row and
+  column, so the text is assertable on the same contract as body prose; parking
+  it in `passages` meant the densest factual material in the document reached
+  no stage.
+- A populated `<desc>` becomes a `figure_content` chunk instead of a
+  `figure_description` literal, for the same reason: under the current tag
+  schema `<desc>` holds what a mermaid diagram or an attached data table was
+  restated into, not prose about how the picture looks. `ont:visualDescription`
+  is still emitted for a document parsed before this change, where `<desc>` was
+  genuinely visual, but is dropped once the text exists as a chunk rather than
+  stored twice.
+- A section id whose heading carried markup is re-derived from the flattened
+  heading. The rewriter slugs the heading as it wrote it, so LaTeX and `<sub>`
+  spelled themselves into the id
+  (`mathsf-p-mathsf-k-mathsf-a-values-depend-on-the-properties`,
+  `p-k-sub-a-sub-values-vary-with-the-environment`), and that id names a graph.
+  The rewriter's id is kept wherever it agrees with a slug of the flattened
+  heading; three sections out of 63 in the current corpus do not agree.
+- Figure text no longer reaches the extractor or the linker. `figure_content`
+  leaves `EXTRACTABLE_CHUNK_KINDS` and `BRIDGE_FIGURE_CAPTIONS` defaults to off,
+  because the current corpus attaches some `<desc>` blocks to the wrong `<fig>`
+  and most figures carry no `src` to depict anything with. The chunk, the
+  caption, the label and the `ont:figureRef` edge are still built, so each
+  switch restores the previous behaviour on its own.
+- `Figure.image_path` comes from `<fig src="...">`. It was synthesized from
+  `fig_id` plus `--figures-dir`/`--figures-ext`, which cannot reproduce a
+  content-hash filename, so every figure resolved to a path that did not exist.
+  The two flags now only relocate a relative src and supply a missing suffix.
+- `ont:figureRef` points at a chunk node rather than carrying a chunk id as a
+  bare literal.
+- `stage5_images.figure_uri` takes `source_id`. The rewriter numbers unnumbered
+  figures with a per-document counter (`fig-x6`), so the bare id collides across
+  chapters as soon as two share a store.
+- `_merge` keys on the source element as well as the section, so two tables in
+  one section cannot merge into a chunk that no single `<tblref>` points at.
+- The document-level sweep covers `<def>` as well as `<sum>` and `<ref>`. The
+  rewriter moved the chapter glossary from inside a section to the foot of the
+  document, where nothing collected it, so the densest definition text in the
+  chapter was dropped silently.
 
 ### Added
 
