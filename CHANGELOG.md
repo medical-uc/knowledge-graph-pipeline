@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `medkg/mcq_corpus.py` and the `mcq_all.py` entry point, which generate MCQs
+  for every document a corpus run left under `artifacts/docs/` and write each
+  paper as `questions.json` beside that document's IR. Papers are built per
+  document rather than pooled, because the distractor blocklist is document
+  local: merging the IRs first would widen every blocklist and cost most of the
+  distractors, and concatenating the papers afterwards would ship items whose
+  distractors were never checked against the document they sit next to. A paper
+  newer than its IR is skipped unless `--no-resume` is given, and a document
+  that raises is reported at the end without stopping the others. Takes the
+  same `--llm`, `--limit` and `--artifacts` options as `mcq.py`, plus `--only`
+  to name individual document stems.
 - `stage1_parse.normalize_inline` unwraps the inline markup the current
   rewriter emits (`<figref>`, `<tblref>`, `<sup>`, `<sub>`) before the block
   parse runs. These tags sit inside a sentence rather than between elements, so

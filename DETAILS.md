@@ -927,6 +927,17 @@ key *or any distractor*. Every rejection falls back to the template stem, so a
 misbehaving model costs prose and never correctness — the same failure direction
 as Stage 2's grounding rule.
 
+**A paper per document, not per corpus.** `mcq.py` takes one IR;
+`mcq_all.py` walks `artifacts/docs/*/ir.json` and writes a `questions.json`
+beside each of them. The papers stay separate because every safety rule above is
+document-local: a blocklist is built from the relations of the document it was
+handed, so a distractor that is safe against one chapter's graph may be the
+asserted answer in another. Merging the IRs first would widen every blocklist
+and cost most of the distractors, and concatenating the papers afterwards would
+ship items whose distractors were never checked against the document they end up
+beside. A paper already newer than its IR is left alone, so an interrupted run
+resumes, and a document that raises is reported without stopping the rest.
+
 ---
 
 ## 16. Where output goes
