@@ -49,6 +49,7 @@ Under an open-world assumption the graph cannot establish that about anything.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -65,32 +66,142 @@ from . import guards
 # --- which relations make a crisp question -------------------------------- #
 # Every template asks for the TAIL, so the answer position is uniform.
 # Indefinite articles throughout: see defence 3 above.
+#
+# Each predicate carries several phrasings of the one question. The variant is
+# chosen by a hash of the predicate and the head, so a rerun over an unchanged
+# graph produces an unchanged paper, and a paper that keys thirty causation
+# facts does not ask for them in thirty identical sentences. The variants of a
+# predicate must be interchangeable: same asked-for role, same indefiniteness,
+# same answer. Anything that shifts what is being asked belongs under its own
+# predicate, not in this tuple.
 STEM_TEMPLATES = {
-    "caused_by":       "Which of the following is a recognised cause of {head}?",
-    "complication_of": "{head_cap} can develop as a complication of which condition?",
-    "treated_with":    "Which agent is used in the management of {head}?",
-    "secretes":        "Which substance is secreted by {head}?",
-    "converts_to":     "{head_cap} {copula} converted into which substance?",
-    "catalyzes":       "{head_cap} acts on which substrate?",
-    "stores":          "Which substance is stored in {head}?",
-    "located_in":      "{head_cap} {copula} found within which structure?",
-    "transports":      "Which substance is transported by {head}?",
-    "part_of":         "{head_cap} {copula} part of which structure?",
-    "synthesizes":     "Which substance is synthesised by {head}?",
-    "requires":        "{head_cap} requires which substance?",
-    "risk_factor_for": "{head_cap} {copula} a risk factor for which condition?",
+    "caused_by": (
+        "Which of the following is a recognised cause of {head}?",
+        "{head_cap} {copula} recognised to result from which of the "
+        "following?",
+        "Which of the following may give rise to {head}?",
+    ),
+    "complication_of": (
+        "{head_cap} can develop as a complication of which condition?",
+        "{head_cap} {copula} a recognised complication of which condition?",
+        "In which condition does {head} arise as a complication?",
+    ),
+    "risk_factor_for": (
+        "{head_cap} {copula} a risk factor for which condition?",
+        "Which condition is {head} recognised to predispose to?",
+        "An increased risk of which condition is associated with {head}?",
+    ),
+    "treated_with": (
+        "Which agent is used in the management of {head}?",
+        "{head_cap} {copula} managed with which of the following?",
+        "Which of the following has a role in the treatment of {head}?",
+    ),
+    "prevented_by": (
+        "Which agent has a role in the prevention of {head}?",
+        "{head_cap} can be prevented by which of the following?",
+    ),
+    "diagnosed_by": (
+        "Which of the following supports a diagnosis of {head}?",
+        "Which of the following is used in the diagnosis of {head}?",
+    ),
+    "adverse_effect_of": (
+        "{head_cap} {copula} a recognised adverse effect of which agent?",
+        "Which agent can produce {head} as an adverse effect?",
+    ),
+    "contraindicated_in": (
+        "{head_cap} {copula} contraindicated in which condition?",
+        "In which condition should {head} be withheld?",
+    ),
+    "secretes": (
+        "Which substance is secreted by {head}?",
+        "{head_cap} secrete{verb_s} which of the following?",
+        "Which of the following is a secretory product of {head}?",
+    ),
+    "synthesizes": (
+        "Which substance is synthesised by {head}?",
+        "{head_cap} synthesise{verb_s} which of the following?",
+        "Which of the following is a synthetic product of {head}?",
+    ),
+    "converts_to": (
+        "{head_cap} {copula} converted into which substance?",
+        "Which substance is formed from {head}?",
+        "Conversion of {head} yields which of the following?",
+    ),
+    "catalyzes": (
+        "{head_cap} act{verb_s} on which substrate?",
+        "Which substrate is acted on by {head}?",
+        "{head_cap} catalyse{verb_s} a reaction involving which substance?",
+    ),
+    "inhibits": (
+        "Which of the following is inhibited by {head}?",
+        "{head_cap} inhibit{verb_s} which of the following?",
+        "{head_cap} reduce{verb_s} the activity of which of the following?",
+    ),
+    "stimulates": (
+        "Which of the following is stimulated by {head}?",
+        "{head_cap} stimulate{verb_s} which of the following?",
+        "{head_cap} increase{verb_s} the activity of which of the "
+        "following?",
+    ),
+    "has_mechanism": (
+        "{head_cap} act{verb_s} through which of the following?",
+        "Which of the following mediates the action of {head}?",
+    ),
+    "requires": (
+        "{head_cap} require{verb_s} which substance?",
+        "Which of the following is required for {head}?",
+        "{head_cap} {copula} dependent on which of the following?",
+    ),
+    "transports": (
+        "Which substance is transported by {head}?",
+        "{head_cap} {copula} responsible for transporting which substance?",
+        "Which of the following is carried by {head}?",
+    ),
+    "stores": (
+        "Which substance is stored in {head}?",
+        "{head_cap} serve{verb_s} as a store of which substance?",
+    ),
+    "located_in": (
+        "{head_cap} {copula} found within which structure?",
+        "In which structure {copula} {head} located?",
+        "Which structure contains {head}?",
+    ),
+    "finding_site": (
+        "{head_cap} {copula} characteristically found at which site?",
+        "Which structure is the site of {head}?",
+    ),
+    "part_of": (
+        "{head_cap} {copula} part of which structure?",
+        "Which structure includes {head}?",
+        "{head_cap} form{verb_s} part of which of the following?",
+    ),
+    "composed_of": (
+        "{head_cap} {copula} composed of which of the following?",
+        "Which of the following is a constituent of {head}?",
+    ),
+    "connects_to": (
+        "{head_cap} connect{verb_s} to which structure?",
+        "Which structure is continuous with {head}?",
+    ),
 }
 
 # `regulates` is deliberately absent: "what does TRH regulate?" has no crisp
 # single answer, and the ontology treats it as the unsigned parent of
-# stimulates/inhibits anyway. Vague relations make vague questions.
+# stimulates/inhibits anyway — both of which are here, because a signed claim
+# does have one. `associated_with` is absent for the same vagueness and because
+# it is symmetric, so the question does not settle which endpoint it wants.
+# `has_function` keys a Finding standing in for a function, which reads as a
+# clause rather than a term, and `present_in_patient` is a fact about one
+# reported case rather than something to be examined on. Vague relations make
+# vague questions.
 
 # Predicates the ontology separates and a candidate cannot. Containment and
 # membership both come out as "which structure", so a head carrying one of each
 # would otherwise be asked twice.
 _QUESTION_CLASSES = {
-    "located_in": "containment",
-    "part_of":    "containment",
+    "located_in":   "containment",
+    "part_of":      "containment",
+    "finding_site": "containment",
 }
 
 MIN_OPTIONS = 5          # 1 key + 4 distractors; fewer -> skip the item entirely
@@ -134,16 +245,36 @@ MAX_OPTION_WORDS = 6     # beyond this an option is a clause, not a term
 
 # Words a stem template contributes itself. An option sharing one of these with
 # the stem is not leaking the key, it just uses the same ordinary vocabulary.
-_STEM_FRAME_WORDS = {
-    "which", "what", "following", "recognised", "recognized", "cause",
-    "causes", "caused", "condition", "conditions", "structure", "structures",
-    "substance", "substances", "agent", "agents", "used", "management",
-    "develop", "develops", "complication", "within", "found", "part",
-    "acts", "acted", "upon", "requires", "required", "risk", "factor",
-    "into", "converted", "converts", "secreted", "secretes", "stored",
-    "stores", "transported", "transports", "synthesised", "synthesized",
-    "substrate", "associated", "increased", "body", "levels", "form",
+# Read off the templates rather than listed by hand, so a new phrasing cannot
+# quietly start flagging its own vocabulary as a leak from the head.
+def _template_frame_words() -> set[str]:
+    """Every word the stem templates contribute, in both number agreements.
+
+    Rendered rather than stripped of its slots, because `{verb_s}` sits inside
+    a word: dropping it would register `secrete` and never `secretes`, and an
+    option reading `glycogen stores` would stop being recognised as template
+    vocabulary. The head is blanked out, since that is the one part of a stem
+    an option genuinely must not repeat.
+    """
+    words: set[str] = set()
+    for variants in STEM_TEMPLATES.values():
+        for variant in variants:
+            for copula, verb_s in (("is", "s"), ("are", "")):
+                body = variant.format(head=" ", head_cap=" ", copula=copula,
+                                      verb_s=verb_s).lower()
+                words.update(re.findall(r"[a-z0-9]+", body))
+    return words
+
+
+# Vocabulary a rewritten stem reaches for that no template uses.
+_REWRITE_FRAME_WORDS = {
+    "what", "recognized", "synthesized", "associated", "increased", "body",
+    "levels", "form", "agents", "substances", "structures", "conditions",
+    "causes", "caused", "develops", "acted", "upon", "converts", "stored",
+    "stores", "transported", "transports",
 }
+
+_STEM_FRAME_WORDS = _template_frame_words() | _REWRITE_FRAME_WORDS
 
 
 @dataclass
@@ -526,17 +657,34 @@ def is_plural_head(head_label: str) -> bool:
     return last.endswith("s") and not last.endswith("ss")
 
 
-def template_stem(rel, head_label: str) -> str:
-    """Fill a stem template, agreeing the copula with the head.
+def variant_index(relation_type: str, head_label: str, count: int) -> int:
+    """Which phrasing of a predicate a given head gets.
 
-    `{copula}` is what keeps "Blood vessels is found within which structure?"
-    out of a template-only run. The rewrite pass repairs most of these when it
-    is enabled, which is exactly why the templates cannot rely on it.
+    Hashed rather than cycled so the choice depends only on the relation and
+    its head: two runs over the same graph agree, and adding or dropping an
+    item elsewhere in the document does not reshuffle every other stem. SHA-1
+    rather than `hash()`, which is salted per process.
     """
-    t = STEM_TEMPLATES[rel.type]
-    return t.format(head=head_label,
-                    head_cap=head_label[:1].upper() + head_label[1:],
-                    copula="are" if is_plural_head(head_label) else "is")
+    digest = hashlib.sha1(
+        f"{relation_type}|{head_label.lower()}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % count
+
+
+def template_stem(rel, head_label: str) -> str:
+    """Fill a stem template, agreeing its verbs with the head.
+
+    `{copula}` and `{verb_s}` are what keep "Blood vessels is found within
+    which structure?" and "Enzymes acts on which substrate?" out of a
+    template-only run. The rewrite pass repairs most of these when it is
+    enabled, which is exactly why the templates cannot rely on it.
+    """
+    variants = STEM_TEMPLATES[rel.type]
+    template = variants[variant_index(rel.type, head_label, len(variants))]
+    plural = is_plural_head(head_label)
+    return template.format(head=head_label,
+                           head_cap=head_label[:1].upper() + head_label[1:],
+                           copula="are" if plural else "is",
+                           verb_s="" if plural else "s")
 
 
 def question_class(relation_type: str) -> str:

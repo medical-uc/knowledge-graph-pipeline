@@ -881,12 +881,35 @@ are individually defensible while the paper asks one question several times with
 several keys. No per-item check can see this, so relations are grouped and
 reduced to the best-attested one during selection.
 
-The grouping is by the question asked, not the predicate stored. `located_in`
-and `part_of` are distinct in the ontology and both come out as "which
-structure", so a head carrying one of each would be asked twice. Rephrasing can
+The grouping is by the question asked, not the predicate stored. `located_in`,
+`part_of` and `finding_site` are distinct in the ontology and all three come out
+as "which structure", so a head carrying more than one would be asked twice.
+Rephrasing can
 also collide two stems that started out distinct, and the stem guard only ever
 sees one item's own options, so a pass after the rewrite reverts a duplicated
 stem to its template and drops the weaker item if they still collide.
+
+**Several phrasings per predicate.** Each questionable predicate carries a
+tuple of stems rather than one, and the variant is chosen by hashing the
+predicate together with the head. The choice therefore depends on nothing but
+the relation being asked about: two runs over the same graph agree, and adding
+an item elsewhere in the document does not reshuffle every other stem. The
+variants of a predicate have to be interchangeable, asking for the same role
+with the same indefiniteness and the same key, because the grouping above has
+already decided that they are one question. Anything that shifts what is being
+asked is a different predicate, not another phrasing of this one.
+
+Verb agreement is part of the template rather than left to the rewrite pass.
+`{copula}` and `{verb_s}` are what keep "Blood vessels is found within which
+structure?" and "Enzymes acts on which substrate?" out of a run with no model
+attached, which is exactly the run that has nothing downstream to repair them.
+
+The leak filter reads its own vocabulary off the rendered templates instead of a
+hand-kept list. An option sharing a word with the stem is dropped as a
+restatement of the head, so every word a template contributes itself has to be
+exempt, and a list maintained by hand goes stale the moment a phrasing is added.
+Both number agreements are rendered, since `{verb_s}` sits inside a word and
+`glycogen stores` would otherwise stop counting as template vocabulary.
 
 **A rationale has to state the fact.** The stored evidence offsets clip to what
 the extractor matched, which on a bulleted list is a single cell: a rationale

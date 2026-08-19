@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Several stem phrasings per predicate in `medkg/mcq.py`, replacing the single
+  template each one carried. The variant is chosen by hashing the predicate
+  together with the head, so a rerun over an unchanged graph produces an
+  unchanged paper and a document that keys thirty causation facts no longer
+  asks for them in thirty identical sentences. Variants of a predicate ask for
+  the same role with the same indefiniteness and the same key, since the
+  question grouping already treats them as one question. 60 phrasings across 23
+  predicates.
+- Stem templates for ten predicates that previously produced no questions:
+  `inhibits`, `stimulates`, `has_mechanism`, `finding_site`, `composed_of`,
+  `adverse_effect_of`, `prevented_by`, `diagnosed_by`, `connects_to` and
+  `contraindicated_in`. Together these cover a further 549 affirmed relations,
+  taking template coverage from 72% to 93% of the affirmed graph and adding 252
+  items to the corpus paper set. `regulates` and `associated_with` stay out:
+  both are too vague to have one best answer, and `associated_with` is
+  symmetric, so the stem cannot settle which endpoint it is asking for.
+  `has_function` and `present_in_patient` stay out because their tails are not
+  answerable terms.
+- `finding_site` joins `located_in` and `part_of` in the containment question
+  class, so a head carrying more than one of them is asked once rather than
+  twice.
 - `medkg/mcq_corpus.py` and the `mcq_all.py` entry point, which generate MCQs
   for every document a corpus run left under `artifacts/docs/` and write each
   paper as `questions.json` beside that document's IR. Papers are built per
@@ -144,6 +165,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Stem templates agree their verbs with the head through a `{verb_s}` slot as
+  well as the existing `{copula}`, so a template-only run no longer emits
+  "Enzymes acts on which substrate?".
+- The MCQ stem-leak filter reads its exempt vocabulary off the rendered
+  templates rather than a hand-maintained word list, in both number agreements.
+  A phrasing added to the table can no longer have its own vocabulary flagged
+  as a leak from the head.
 - A table's restated grid is now an extractable chunk. `table` moves out of
   `PASSAGE_KINDS` into `CHUNK_KINDS` and `EXTRACTABLE_CHUNK_KINDS`, and a
   `<tbl>`'s `<cap>` is split off rather than flattened into the body. The
